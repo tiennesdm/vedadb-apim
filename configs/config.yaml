@@ -1,0 +1,403 @@
+# =============================================================================
+# VedaDB API Manager (VAPIM) Configuration
+# =============================================================================
+# This is the complete example configuration file for the VedaDB API Manager.
+# All settings can be overridden via environment variables (see below).
+#
+# Environment Variable Overrides:
+#   VAPIM_SERVER_PORT        - Server port
+#   VAPIM_SERVER_TLS_ENABLED - Enable TLS
+#   VAPIM_DATABASE_HOST      - VedaDB host
+#   VAPIM_DATABASE_PORT      - VedaDB port
+#   VAPIM_DATABASE_PASSWORD  - VedaDB password
+#   VAPIM_JWT_SECRET         - JWT signing secret
+#   VAPIM_JWT_REFRESH_SECRET - JWT refresh secret
+#   VAPIM_LOG_LEVEL          - Log level (debug, info, warn, error)
+#   VAPIM_THROTTLE_ENABLED   - Enable throttling
+#   VAPIM_CACHE_ENABLED      - Enable caching
+#   VAPIM_ANALYTICS_ENABLED  - Enable analytics
+#   VAPIM_GATEWAY_WORKERS    - Number of gateway workers
+#   VAPIM_AUTH_ENABLED       - Enable authentication
+#   VAPIM_RATE_LIMIT_ENABLED - Enable rate limiting
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# Server Configuration
+# ---------------------------------------------------------------------------
+server:
+  # HTTP server port
+  port: 9443
+  
+  # Enable TLS
+  tls_enabled: false
+  
+  # TLS certificate and key files (required when tls_enabled: true)
+  tls_cert_file: ""
+  tls_key_file: ""
+  
+  # Minimum TLS version (TLSv1.2, TLSv1.3)
+  tls_min_version: "TLSv1.2"
+  
+  # Timeouts (Go duration format)
+  read_timeout: "30s"
+  write_timeout: "30s"
+  idle_timeout: "120s"
+  
+  # Graceful shutdown timeout
+  shutdown_timeout: "30s"
+  
+  # Maximum header size in bytes
+  max_header_bytes: 1048576  # 1 MB
+  
+  # Enable HTTP keep-alive
+  keep_alive: true
+
+# ---------------------------------------------------------------------------
+# Gateway Configuration
+# ---------------------------------------------------------------------------
+gateway:
+  # Worker pool size for concurrent request processing
+  worker_pool_size: 100
+  
+  # Request/response buffer sizes
+  request_buffer_size: 1000
+  response_buffer_size: 1000
+  
+  # Maximum request/response body sizes
+  max_request_body_size: 10485760   # 10 MB
+  max_response_body_size: 10485760  # 10 MB
+  
+  # Request timeout
+  request_timeout: "30s"
+  
+  # Retry configuration
+  retry_count: 3
+  retry_backoff: "100ms"
+  
+  # Circuit breaker configuration
+  circuit_breaker:
+    enabled: true
+    failure_threshold: 5
+    success_threshold: 2
+    timeout: "30s"
+    half_open_max_calls: 3
+  
+  # Proxy settings
+  proxy_preserve_host: false
+  proxy_read_timeout: "30s"
+  proxy_write_timeout: "30s"
+  
+  # Protocol support
+  websocket_enabled: true
+  sse_enabled: true
+  
+  # Schema validation
+  schema_validation: true
+  
+  # Enforce HTTPS redirects
+  enforce_https: false
+
+# ---------------------------------------------------------------------------
+# Database Configuration (VedaDB)
+# ---------------------------------------------------------------------------
+database:
+  # VedaDB host
+  host: "localhost"
+  
+  # VedaDB port (default: 6380)
+  port: 6380
+  
+  # Authentication (if required)
+  username: ""
+  password: ""
+  
+  # Database name
+  database: "apim"
+  
+  # Connection timeout
+  timeout: "10s"
+  
+  # Maximum retry attempts
+  max_retries: 3
+  
+  # Connection pool size
+  pool_size: 10
+  
+  # Connection lifetime
+  connection_lifetime: "30m"
+  
+  # Health check interval
+  health_check_interval: "30s"
+  
+  # Enable TLS for database connection
+  tls: false
+
+# ---------------------------------------------------------------------------
+# Authentication Configuration
+# ---------------------------------------------------------------------------
+auth:
+  # Enable authentication
+  enabled: true
+  
+  # JWT signing secrets (CHANGE IN PRODUCTION!)
+  jwt_secret: "vedadb-apim-jwt-secret-change-in-production"
+  jwt_refresh_secret: "vedadb-apim-refresh-secret-change-in-production"
+  
+  # Token expiry durations
+  access_token_expiry: "15m"
+  refresh_token_expiry: "168h"  # 7 days
+  
+  # Token issuer and audience
+  token_issuer: "vedadb-apim"
+  token_audience: "vedadb-apim-gateway"
+  
+  # Token location in requests
+  header_name: "Authorization"
+  query_param_name: "access_token"
+  
+  # Paths that skip authentication
+  skip_paths:
+    - "/health"
+    - "/admin/health"
+    - "/metrics"
+    - "/admin/metrics"
+  
+  # Skip auth for OPTIONS requests (CORS preflight)
+  skip_auth_for_options: true
+  
+  # Enable token revocation checking
+  revocation_check: true
+  
+  # Revocation list refresh interval
+  revocation_list_refresh: "5m"
+  
+  # Enable token caching
+  cache_tokens: true
+  
+  # Token cache TTL
+  token_cache_ttl: "5m"
+
+# ---------------------------------------------------------------------------
+# Throttle Configuration
+# ---------------------------------------------------------------------------
+throttle:
+  # Enable throttling
+  enabled: true
+  
+  # Default throttle policy
+  default_policy: "Unlimited"
+  
+  # Include throttle headers in responses
+  header_enabled: true
+  
+  # Tier for unauthenticated requests
+  unauthenticated_tier: "Bronze"
+  
+  # Spike arrest configuration
+  spike_arrest_enabled: true
+  spike_arrest_rate: 1000
+  
+  # Conditional throttling
+  condition_group_enabled: true
+  jwt_claim_enabled: true
+  ip_based_throttling: true
+  
+  # Data publisher
+  data_publisher_enabled: true
+  data_publisher_buffer_size: 10000
+
+# ---------------------------------------------------------------------------
+# Cache Configuration
+# ---------------------------------------------------------------------------
+cache:
+  # Enable response caching
+  enabled: true
+  
+  # Default cache TTL
+  default_ttl: "5m"
+  
+  # Maximum number of cache entries
+  max_size: 10000
+  
+  # Maximum size of a single cache entry
+  max_entry_size: 1048576  # 1 MB
+  
+  # Cache eviction policy (lru, lfu, random)
+  eviction_policy: "lru"
+  
+  # Cache bypass header
+  cache_bypass_header: "X-Cache-Bypass"
+  cache_bypass_value: "true"
+  
+  # Stale-while-revalidate duration
+  stale_while_revalidate: "1m"
+  
+  # HTTP methods that can be cached
+  cacheable_methods:
+    - "GET"
+    - "HEAD"
+  
+  # HTTP status codes that can be cached
+  cacheable_status_codes:
+    - 200
+    - 201
+    - 204
+    - 301
+    - 302
+    - 404
+  
+  # Headers to vary cache by
+  vary_by_headers:
+    - "Accept"
+    - "Accept-Encoding"
+    - "Authorization"
+
+# ---------------------------------------------------------------------------
+# Analytics Configuration
+# ---------------------------------------------------------------------------
+analytics:
+  # Enable analytics collection
+  enabled: true
+  
+  # Data retention period
+  retention_period: "720h"  # 30 days
+  
+  # Batch settings
+  batch_size: 100
+  flush_interval: "10s"
+  buffer_size: 10000
+  
+  # Storage settings
+  store_enabled: true
+  store_type: "vedadb"
+  store_endpoint: ""
+  
+  # Geo-location
+  geo_location_enabled: false
+  
+  # User agent parsing
+  user_agent_parsing: true
+
+# ---------------------------------------------------------------------------
+# CORS Configuration
+# ---------------------------------------------------------------------------
+cors:
+  # Enable CORS
+  enabled: true
+  
+  # Allowed origins
+  allow_origins:
+    - "*"
+  
+  # Allowed HTTP methods
+  allow_methods:
+    - "GET"
+    - "POST"
+    - "PUT"
+    - "PATCH"
+    - "DELETE"
+    - "HEAD"
+    - "OPTIONS"
+  
+  # Allowed headers
+  allow_headers:
+    - "Origin"
+    - "Content-Type"
+    - "Accept"
+    - "Authorization"
+    - "X-Request-ID"
+    - "X-API-Key"
+    - "X-Cache-Bypass"
+  
+  # Exposed headers
+  expose_headers:
+    - "X-Request-ID"
+    - "X-RateLimit-Limit"
+    - "X-RateLimit-Remaining"
+    - "X-RateLimit-Reset"
+    - "X-Cache"
+    - "X-Cache-Hits"
+  
+  # Allow credentials
+  allow_credentials: true
+  
+  # Max age for preflight cache
+  max_age: 86400
+
+# ---------------------------------------------------------------------------
+# Key Manager Configuration
+# ---------------------------------------------------------------------------
+key_manager:
+  # Enable embedded key manager
+  enabled: true
+  
+  # Key manager port
+  port: 9444
+  
+  # Supported OAuth2 grant types
+  supported_grants:
+    - "client_credentials"
+    - "password"
+    - "refresh_token"
+    - "authorization_code"
+  
+  # Enable token revocation
+  revoke_tokens_enabled: true
+
+# ---------------------------------------------------------------------------
+# Publisher Configuration
+# ---------------------------------------------------------------------------
+publisher:
+  # Enable publisher API
+  enabled: true
+  
+  # Publisher API port
+  port: 9445
+
+# ---------------------------------------------------------------------------
+# Logging Configuration
+# ---------------------------------------------------------------------------
+log:
+  # Log level (debug, info, warn, error, fatal)
+  level: "info"
+  
+  # Log format (json, console)
+  format: "json"
+  
+  # Log output (stdout, stderr, file)
+  output: "stdout"
+  
+  # File path (when output is "file")
+  file_path: ""
+  
+  # Log rotation settings
+  max_size: 100      # MB
+  max_backups: 5
+  max_age: 30        # days
+  compress: true
+
+# ---------------------------------------------------------------------------
+# Mutual TLS Configuration
+# ---------------------------------------------------------------------------
+mutual_tls:
+  enabled: false
+  client_ca_file: ""
+  insecure_skip_verify: false
+
+# ---------------------------------------------------------------------------
+# Rate Limit Configuration
+# ---------------------------------------------------------------------------
+rate_limit:
+  enabled: true
+  default_limit: 100
+  default_window: "1m"
+  header_limit_name: "X-RateLimit-Limit"
+  header_remaining_name: "X-RateLimit-Remaining"
+  header_reset_name: "X-RateLimit-Reset"
+  header_retry_after_name: "Retry-After"
+  
+  # Distributed rate limiting (requires Redis/VedaDB)
+  redis_enabled: false
+  redis_addr: "localhost:6379"
+  redis_password: ""
+  redis_db: 0
