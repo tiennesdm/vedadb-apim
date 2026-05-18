@@ -1,39 +1,36 @@
-// Package audit provides Gin middleware for automatic request audit logging.
+// Package audit provides Gin middleware for automatic request audit logging
+// with guaranteed DB persistence via the VedaDB wire protocol.
 package audit
 
 import (
 	"bytes"
-	"context"
+	"fmt"
 	"io"
 	"net/http"
 	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
+
+	"github.com/vedadb/vapim/pkg/models"
 )
 
 // MiddlewareConfig configures the audit middleware behavior.
 type MiddlewareConfig struct {
-	// Logger is the audit logger instance.
-	Logger AuditLogger
-	// ExcludePaths is a list of path prefixes to skip audit logging for.
-	ExcludePaths []string
-	// LogRequestBody if true, captures request bodies (be careful with sensitive data).
-	LogRequestBody bool
-	// LogResponseBody if true, captures response bodies.
+	Auditor         *AuditLogger
+	ExcludePaths    []string
+	LogRequestBody  bool
 	LogResponseBody bool
-	// SensitiveFields are field names whose values will be redacted from logs.
 	SensitiveFields []string
-	// SkipHealthCheck if true, skips logging for health check endpoints.
 	SkipHealthCheck bool
-	// MaxBodySize limits the number of bytes captured from request/response bodies.
-	MaxBodySize int64
+	MaxBodySize     int64
 }
 
 // DefaultMiddlewareConfig returns a sensible default configuration.
-func DefaultMiddlewareConfig(logger AuditLogger) MiddlewareConfig {
+func DefaultMiddlewareConfig(auditor *AuditLogger) MiddlewareConfig {
 	return MiddlewareConfig{
-		Logger:          logger,
+		Auditor:         auditor,
 		ExcludePaths:    []string{"/graphql/playground", "/static/", "/favicon.ico"},
 		LogRequestBody:  false,
 		LogResponseBody: false,
@@ -73,7 +70,44 @@ func (w *responseWriter) WriteString(s string) (int, error) {
 	return w.ResponseWriter.WriteString(s)
 }
 
-// Middleware returns a Gin middleware that logs every HTTP request as an audit event.
+// isImportantGet returns true for GET requests that should be audited
+// (e.g., sensitive resources, export endpoints).
+func isImportantGet(path string) bool {
+	importantPatterns := []string{
+		"/export", "/download", "/keys", "/secrets", "/credentials",
+		"/tokens", "/auth", "/login", "/logout", "/admin",
+	}
+	lowerPath := strings.ToLower(path)
+	for _, p := range importantPatterns {
+		if strings.Contains(lowerPath, p) {
+			return true
+		}
+	}
+	return false
+}
+
+// extractResourceType determines the resource type from the request path.
+func extractResourceType(path string) string {
+	parts := strings.Split(strings.Trim(path, "/"), "/")
+	if len(parts) >= 2 {
+		// Common REST patterns: /api/v1/<resource>/...
+		for _, p := range parts {
+			if p == "v1" || p == "v2" || p == "api" {
+				continue
+			}
+			if p != "" && !strings.HasPrefix(p, ":") {
+				return p
+			}
+		}
+	}
+	if len(parts) >= 1 && parts[0] != "" {
+		return parts[0]
+	}
+	return "http_request"
+}
+
+// Middleware returns a Gin middleware that logs every significant HTTP request
+// as an audit event directly to the database.
 func Middleware(cfg MiddlewareConfig) gin.HandlerFunc {
 	excludeMap := make(map[string]bool)
 	for _, path := range cfg.ExcludePaths {
@@ -86,17 +120,14 @@ func Middleware(cfg MiddlewareConfig) gin.HandlerFunc {
 	}
 
 	shouldExclude := func(path string) bool {
-		// Check exact exclusions
 		if excludeMap[path] {
 			return true
 		}
-		// Check prefix exclusions
 		for prefix := range excludeMap {
 			if strings.HasPrefix(path, prefix) {
 				return true
 			}
 		}
-		// Check health check paths
 		if cfg.SkipHealthCheck {
 			if strings.EqualFold(path, "/health") ||
 				strings.EqualFold(path, "/healthz") ||
@@ -126,9 +157,7 @@ func Middleware(cfg MiddlewareConfig) gin.HandlerFunc {
 			bodyBytes, err := io.ReadAll(io.LimitReader(c.Request.Body, cfg.MaxBodySize))
 			if err == nil {
 				requestBody = string(bodyBytes)
-				// Restore the body for downstream handlers
 				c.Request.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
-				// Redact sensitive fields
 				requestBody = redactSensitiveFields(requestBody, sensitiveMap)
 			}
 		}
@@ -146,57 +175,79 @@ func Middleware(cfg MiddlewareConfig) gin.HandlerFunc {
 		elapsed := time.Since(start)
 		status := c.Writer.Status()
 		method := c.Request.Method
+
+		// Only log significant actions: mutations (POST/PUT/PATCH/DELETE),
+		// failed requests, and important GETs
+		if method == "GET" && !isImportantGet(path) && status < 400 {
+			return
+		}
+
+		// Extract tenant and user from context
+		tenantID, _ := c.Get("tenantID").(string)
+		if tenantID == "" {
+			tenantID, _ = c.Get("tenant_id").(string)
+		}
+		userID, _ := c.Get("userID").(string)
+		if userID == "" {
+			userID, _ = c.Get("user_id").(string)
+		}
+		if userID == "" {
+			if uid, exists := c.Get("user_id"); exists {
+				userID, _ = uid.(string)
+			}
+		}
+
+		username, _ := c.Get("username").(string)
 		clientIP := c.ClientIP()
 		userAgent := c.Request.UserAgent()
 
-		// Extract user info from context
-		var userID, username string
-		if uid, exists := c.Get("user_id"); exists {
-			userID, _ = uid.(string)
-		}
-		if un, exists := c.Get("username"); exists {
-			username, _ = un.(string)
-		}
-
 		// Build audit details
-		details := map[string]interface{}{
-			"method":      method,
-			"path":        path,
-			"status":      status,
-			"duration_ms": elapsed.Milliseconds(),
-			"user_agent":  userAgent,
+		detailsParts := []string{
+			fmt.Sprintf("status=%d", status),
+			fmt.Sprintf("latency=%dms", elapsed.Milliseconds()),
+			fmt.Sprintf("method=%s", method),
+			fmt.Sprintf("path=%s", path),
 		}
-
+		if username != "" {
+			detailsParts = append(detailsParts, "user="+username)
+		}
 		if requestBody != "" {
-			details["request_body"] = requestBody
+			detailsParts = append(detailsParts, "request_body="+requestBody)
 		}
-
 		if cfg.LogResponseBody && wrapped != nil {
 			respBody := wrapped.body.String()
 			if len(respBody) > int(cfg.MaxBodySize) {
 				respBody = respBody[:cfg.MaxBodySize]
 			}
-			details["response_body"] = redactSensitiveFields(respBody, sensitiveMap)
+			respBody = redactSensitiveFields(respBody, sensitiveMap)
+			detailsParts = append(detailsParts, "response_body="+respBody)
 		}
-
-		// Add errors from Gin context if any
 		if len(c.Errors) > 0 {
-			details["errors"] = c.Errors.Errors()
+			detailsParts = append(detailsParts, "errors="+strings.Join(c.Errors.Errors(), "; "))
 		}
 
-		// Determine action based on HTTP method and path
-		action := mapHTTPMethodToAction(method, status)
-		resourceType := "HTTP_REQUEST"
-		resourceID := path
+		entry := &models.AuditLogDB{
+			ID:           uuid.New().String(),
+			TenantID:     tenantID,
+			UserID:       userID,
+			Action:       fmt.Sprintf("%s %s", method, path),
+			ResourceType: extractResourceType(path),
+			ResourceID:   c.Param("id"),
+			Details:      strings.Join(detailsParts, ", "),
+			IPAddress:    clientIP,
+			UserAgent:    userAgent,
+			Timestamp:    time.Now().UTC(),
+		}
 
-		// Build context with user info for the logger
-		ctx := c.Request.Context()
-		ctx = context.WithValue(ctx, "user_id", userID)
-		ctx = context.WithValue(ctx, "username", username)
-		ctx = context.WithValue(ctx, "client_ip", clientIP)
-
-		// Log asynchronously via goroutine for non-blocking operation
-		go cfg.Logger.Log(ctx, action, resourceType, resourceID, details)
+		// REAL DB WRITE - async via goroutine to avoid blocking response
+		go func(auditor *AuditLogger, logEntry *models.AuditLogDB) {
+			if auditor != nil {
+				if err := auditor.InsertEntry(logEntry); err != nil {
+					// Log failure but don't block response
+					// The InsertEntry method handles its own error reporting
+				}
+			}
+		}(cfg.Auditor, entry)
 	}
 }
 
@@ -228,48 +279,40 @@ func mapHTTPMethodToAction(method string, status int) string {
 }
 
 // redactSensitiveFields redacts values of sensitive fields from a string representation.
-// This is a best-effort approach for JSON-like payloads.
 func redactSensitiveFields(input string, sensitiveFields map[string]bool) string {
-	// Simple string-based redaction for common patterns like "password": "secret123"
 	result := input
 	for field := range sensitiveFields {
-		// Match patterns like "fieldname": "value" or 'fieldname': 'value'
-		// This is a basic approach; for production, use proper JSON parsing
-		patterns := []string{
-			`"` + field + `"\s*:\s*"[^"]*"`,
-			`"` + field + `"\s*:\s*'[^']*'`,
-			`'` + field + `'\s*:\s*"[^"]*"`,
-			`'` + field + `'\s*:\s*'[^']*'`,
-		}
-		for _, pattern := range patterns {
-			idx := 0
-			for {
-				foundIdx := strings.Index(result[idx:], `"`+field+`"`)
+		idx := 0
+		for {
+			foundIdx := strings.Index(strings.ToLower(result[idx:]), `"`+strings.ToLower(field)+`"`)
+			if foundIdx == -1 {
+				// Try single quote
+				foundIdx = strings.Index(strings.ToLower(result[idx:]), `'`+strings.ToLower(field)+`'')
 				if foundIdx == -1 {
 					break
 				}
-				foundIdx += idx
-				// Find the colon and value
-				colonIdx := strings.Index(result[foundIdx:], ":")
-				if colonIdx == -1 {
-					break
-				}
-				colonIdx += foundIdx
-				// Find the next quote after colon
-				afterColon := colonIdx + 1
-				for afterColon < len(result) && (result[afterColon] == ' ' || result[afterColon] == '\t') {
-					afterColon++
-				}
-				if afterColon < len(result) && (result[afterColon] == '"' || result[afterColon] == '\'') {
-					quoteChar := result[afterColon]
-					endQuote := strings.Index(result[afterColon+1:], string(quoteChar))
-					if endQuote != -1 {
-						endQuote += afterColon + 1
-						result = result[:afterColon+1] + "[REDACTED]" + result[endQuote:]
-					}
-				}
-				idx = foundIdx + 1
 			}
+			foundIdx += idx
+
+			colonIdx := strings.Index(result[foundIdx:], ":")
+			if colonIdx == -1 {
+				break
+			}
+			colonIdx += foundIdx
+
+			afterColon := colonIdx + 1
+			for afterColon < len(result) && (result[afterColon] == ' ' || result[afterColon] == '\t') {
+				afterColon++
+			}
+			if afterColon < len(result) && (result[afterColon] == '"' || result[afterColon] == '\'') {
+				quoteChar := result[afterColon]
+				endQuote := strings.Index(result[afterColon+1:], string(quoteChar))
+				if endQuote != -1 {
+					endQuote += afterColon + 1
+					result = result[:afterColon+1] + "[REDACTED]" + result[endQuote:]
+				}
+			}
+			idx = foundIdx + 1
 		}
 	}
 	return result

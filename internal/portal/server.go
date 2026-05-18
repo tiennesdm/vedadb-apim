@@ -82,6 +82,9 @@ type Store interface {
 
 	// Users
 	GetUserByToken(ctx context.Context, token string) (*models.User, error)
+
+	// Analytics
+	InsertAnalyticsEvent(e *models.AnalyticsEventDB) error
 }
 
 // Server is the Developer Portal HTTP server.

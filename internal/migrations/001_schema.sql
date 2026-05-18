@@ -249,6 +249,50 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
     applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
+-- API Changelog
+CREATE TABLE IF NOT EXISTS api_changelog (
+    id VARCHAR(36) PRIMARY KEY,
+    api_id VARCHAR(36) REFERENCES apis(id),
+    change_type VARCHAR(50) NOT NULL,
+    description TEXT,
+    changed_by VARCHAR(36),
+    changed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- API Mocks
+CREATE TABLE IF NOT EXISTS api_mocks (
+    id VARCHAR(36) PRIMARY KEY,
+    api_id VARCHAR(36) REFERENCES apis(id),
+    method VARCHAR(10) NOT NULL,
+    path VARCHAR(255) NOT NULL,
+    status_code INT DEFAULT 200,
+    headers TEXT,
+    body TEXT,
+    delay_ms INT DEFAULT 0,
+    status VARCHAR(20) DEFAULT 'active',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(api_id, method, path)
+);
+
+-- API Request Validation Schemas
+CREATE TABLE IF NOT EXISTS api_schemas (
+    id VARCHAR(36) PRIMARY KEY,
+    resource_id VARCHAR(36) REFERENCES api_resources(id),
+    schema_type VARCHAR(20) NOT NULL,
+    schema_json TEXT NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Throttle Counters (for distributed rate limiting)
+CREATE TABLE IF NOT EXISTS throttle_counters (
+    id VARCHAR(36) PRIMARY KEY,
+    counter_key VARCHAR(255) NOT NULL,
+    window_start TIMESTAMP NOT NULL,
+    count INT DEFAULT 0,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(counter_key, window_start)
+);
+
 -- Indexes
 CREATE INDEX IF NOT EXISTS idx_apis_tenant ON apis(tenant_id);
 CREATE INDEX IF NOT EXISTS idx_apis_status ON apis(status);
@@ -261,3 +305,7 @@ CREATE INDEX IF NOT EXISTS idx_tokens_expires ON tokens(expires_at);
 CREATE INDEX IF NOT EXISTS idx_analytics_timestamp ON analytics_events(timestamp);
 CREATE INDEX IF NOT EXISTS idx_analytics_api ON analytics_events(api_id);
 CREATE INDEX IF NOT EXISTS idx_audit_timestamp ON audit_log(timestamp);
+CREATE INDEX IF NOT EXISTS idx_changelog_api ON api_changelog(api_id);
+CREATE INDEX IF NOT EXISTS idx_mocks_api ON api_mocks(api_id);
+CREATE INDEX IF NOT EXISTS idx_schemas_resource ON api_schemas(resource_id);
+CREATE INDEX IF NOT EXISTS idx_throttle_counters_key ON throttle_counters(counter_key);

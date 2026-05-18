@@ -14,8 +14,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/tiennesdm/vedadb-apim/pkg/errors"
-	"github.com/tiennesdm/vedadb-apim/pkg/models"
+	"github.com/google/uuid"
+	"github.com/vedadb/vapim/pkg/errors"
+	"github.com/vedadb/vapim/pkg/models"
 )
 
 // ---------------------------------------------------------------------------
@@ -128,6 +129,32 @@ type Store interface {
 	// Webhook Deliveries
 	CreateWebhookDelivery(d *models.WebhookDeliveryDB) error
 	UpdateWebhookDelivery(d *models.WebhookDeliveryDB) error
+
+	// Throttle Counters (for distributed rate limiting)
+	IncrementThrottleCounter(key string, window time.Time) error
+	GetThrottleCounter(key string, window time.Time) (int, error)
+	ResetThrottleCounter(key string) error
+
+	// API Mocks
+	CreateMock(m *models.APIMockDB) error
+	GetMock(apiID, method, path string) (*models.APIMockDB, error)
+	GetMockByID(id string) (*models.APIMockDB, error)
+	ListMocks(apiID string) ([]*models.APIMockDB, error)
+	UpdateMock(m *models.APIMockDB) error
+	DeleteMock(id string) error
+	DeleteAllMocksForAPI(apiID string) error
+
+	// API Changelog
+	InsertChangelog(entry *models.APIChangeDB) error
+	GetChangelog(apiID string) ([]*models.APIChangeDB, error)
+
+	// Raw query execution (for analytics aggregation, custom queries)
+	RawQuery(query string, args ...interface{}) ([]json.RawMessage, error)
+	Exec(query string, args ...interface{}) error
+
+	// Request/Response Schemas
+	CreateSchema(schema *models.APISchemaDB) error
+	GetSchema(resourceID, schemaType string) (*models.APISchemaDB, error)
 
 	// Migrations
 	RunMigration(name, sql string) error
@@ -1281,6 +1308,154 @@ func (s *VedaDBStore) UpdateWebhookDelivery(d *models.WebhookDeliveryDB) error {
 }
 
 // ---------------------------------------------------------------------------
+// Throttle Counters (for distributed rate limiting)
+// ---------------------------------------------------------------------------
+
+func (s *VedaDBStore) IncrementThrottleCounter(key string, window time.Time) error {
+	q := `INSERT INTO throttle_counters (id, counter_key, window_start, count)
+		VALUES (?, ?, ?, 1)
+		ON CONFLICT (counter_key, window_start) DO UPDATE SET count = count + 1, updated_at = ?`
+	_, err := s.exec(context.Background(), q, uuid.New().String(), key, window, time.Now())
+	return err
+}
+
+func (s *VedaDBStore) GetThrottleCounter(key string, window time.Time) (int, error) {
+	var row struct {
+		Count int `json:"count"`
+	}
+	q := `SELECT count FROM throttle_counters WHERE counter_key = ? AND window_start = ?`
+	if err := s.queryOne(context.Background(), &row, q, key, window); err != nil {
+		if err == sql.ErrNoRows {
+			return 0, nil
+		}
+		return 0, err
+	}
+	return row.Count, nil
+}
+
+// ---------------------------------------------------------------------------
+// API Mocks
+// ---------------------------------------------------------------------------
+
+func (s *VedaDBStore) CreateMock(m *models.APIMockDB) error {
+	q := `INSERT INTO api_mocks (id, api_id, method, path, status_code, headers, body, delay_ms, status)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active')`
+	_, err := s.exec(context.Background(), q, m.ID, m.APIID, m.Method, m.Path, m.StatusCode, m.Headers, m.Body, m.DelayMS)
+	return err
+}
+
+func (s *VedaDBStore) GetMock(apiID, method, path string) (*models.APIMockDB, error) {
+	var m models.APIMockDB
+	q := `SELECT id, api_id, method, path, status_code, headers, body, delay_ms
+		FROM api_mocks WHERE api_id = ? AND method = ? AND path = ? AND status = 'active'`
+	if err := s.queryOne(context.Background(), &m, q, apiID, method, path); err != nil {
+		return nil, err
+	}
+	return &m, nil
+}
+
+func (s *VedaDBStore) ListMocks(apiID string) ([]*models.APIMockDB, error) {
+	q := `SELECT id, api_id, method, path, status_code, headers, body, delay_ms
+		FROM api_mocks WHERE api_id = ? AND status = 'active'`
+	raws, _, err := s.queryMany(context.Background(), q, apiID)
+	if err != nil {
+		return nil, err
+	}
+	mocks := make([]*models.APIMockDB, 0, len(raws))
+	for _, raw := range raws {
+		var m models.APIMockDB
+		if err := json.Unmarshal(raw, &m); err != nil {
+			continue
+		}
+		mocks = append(mocks, &m)
+	}
+	return mocks, nil
+}
+
+func (s *VedaDBStore) GetMockByID(id string) (*models.APIMockDB, error) {
+	var m models.APIMockDB
+	q := `SELECT id, api_id, method, path, status_code, headers, body, delay_ms, status, created_at
+		FROM api_mocks WHERE id = ?`
+	if err := s.queryOne(context.Background(), &m, q, id); err != nil {
+		return nil, err
+	}
+	return &m, nil
+}
+
+func (s *VedaDBStore) UpdateMock(m *models.APIMockDB) error {
+	q := `UPDATE api_mocks SET status_code = ?, headers = ?, body = ?, delay_ms = ?, status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`
+	_, err := s.exec(context.Background(), q, m.StatusCode, m.Headers, m.Body, m.DelayMS, m.Status, m.ID)
+	return err
+}
+
+func (s *VedaDBStore) DeleteMock(id string) error {
+	q := `DELETE FROM api_mocks WHERE id = ?`
+	_, err := s.exec(context.Background(), q, id)
+	return err
+}
+
+func (s *VedaDBStore) DeleteAllMocksForAPI(apiID string) error {
+	q := `DELETE FROM api_mocks WHERE api_id = ?`
+	_, err := s.exec(context.Background(), q, apiID)
+	return err
+}
+
+func (s *VedaDBStore) ResetThrottleCounter(key string) error {
+	q := `DELETE FROM throttle_counters WHERE counter_key = ?`
+	_, err := s.exec(context.Background(), q, key)
+	return err
+}
+
+// ---------------------------------------------------------------------------
+// API Changelog
+// ---------------------------------------------------------------------------
+
+func (s *VedaDBStore) InsertChangelog(entry *models.APIChangeDB) error {
+	q := `INSERT INTO api_changelog (id, api_id, change_type, description, changed_by, changed_at)
+		VALUES (?, ?, ?, ?, ?, ?)`
+	_, err := s.exec(context.Background(), q, entry.ID, entry.APIID, entry.ChangeType, entry.Description, entry.ChangedBy, entry.ChangedAt)
+	return err
+}
+
+func (s *VedaDBStore) GetChangelog(apiID string) ([]*models.APIChangeDB, error) {
+	q := `SELECT id, api_id, change_type, description, changed_by, changed_at
+		FROM api_changelog WHERE api_id = ? ORDER BY changed_at DESC`
+	raws, _, err := s.queryMany(context.Background(), q, apiID)
+	if err != nil {
+		return nil, err
+	}
+	changes := make([]*models.APIChangeDB, 0, len(raws))
+	for _, raw := range raws {
+		var c models.APIChangeDB
+		if err := json.Unmarshal(raw, &c); err != nil {
+			continue
+		}
+		changes = append(changes, &c)
+	}
+	return changes, nil
+}
+
+// ---------------------------------------------------------------------------
+// Request/Response Schemas
+// ---------------------------------------------------------------------------
+
+func (s *VedaDBStore) CreateSchema(schema *models.APISchemaDB) error {
+	q := `INSERT INTO api_schemas (id, resource_id, schema_type, schema_json) VALUES (?, ?, ?, ?)`
+	_, err := s.exec(context.Background(), q, schema.ID, schema.ResourceID, schema.SchemaType, schema.SchemaJSON)
+	return err
+}
+
+func (s *VedaDBStore) GetSchema(resourceID, schemaType string) (*models.APISchemaDB, error) {
+	var sch models.APISchemaDB
+	q := `SELECT id, resource_id, schema_type, schema_json
+		FROM api_schemas WHERE resource_id = ? AND schema_type = ?`
+	if err := s.queryOne(context.Background(), &sch, q, resourceID, schemaType); err != nil {
+		return nil, err
+	}
+	return &sch, nil
+}
+
+// ---------------------------------------------------------------------------
 // Migrations
 // ---------------------------------------------------------------------------
 
@@ -1377,4 +1552,20 @@ func splitMigrationStatements(sql string) []string {
 		statements = append(statements, remaining)
 	}
 	return statements
+}
+
+// ---------------------------------------------------------------------------
+// Raw query execution (exported for analytics, custom queries)
+// ---------------------------------------------------------------------------
+
+// RawQuery executes a raw SQL query and returns the rows as raw JSON messages.
+func (s *VedaDBStore) RawQuery(query string, args ...interface{}) ([]json.RawMessage, error) {
+	raws, _, err := s.queryMany(context.Background(), query, args...)
+	return raws, err
+}
+
+// Exec executes a raw SQL statement (INSERT, UPDATE, DELETE) and returns an error if any.
+func (s *VedaDBStore) Exec(query string, args ...interface{}) error {
+	_, err := s.exec(context.Background(), query, args...)
+	return err
 }

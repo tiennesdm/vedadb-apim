@@ -263,3 +263,36 @@ type UsageDataPoint struct {
 	ErrorCount   int64     `json:"error_count"`
 	AvgLatencyMs int64     `json:"avg_latency_ms"`
 }
+
+// APIMockDB is the database representation of an API mock response.
+type APIMockDB struct {
+	ID         string    `json:"id"`
+	APIID      string    `json:"api_id"`
+	Method     string    `json:"method"`
+	Path       string    `json:"path"`
+	StatusCode int       `json:"status_code"`
+	Headers    string    `json:"headers"`
+	Body       string    `json:"body"`
+	DelayMS    int       `json:"delay_ms"`
+	Status     string    `json:"status"`
+	CreatedAt  time.Time `json:"created_at"`
+}
+
+// APIChangeDB is the database representation of an API changelog entry.
+type APIChangeDB struct {
+	ID          string    `json:"id"`
+	APIID       string    `json:"api_id"`
+	ChangeType  string    `json:"change_type"`
+	Description string    `json:"description"`
+	ChangedBy   string    `json:"changed_by"`
+	ChangedAt   time.Time `json:"changed_at"`
+}
+
+// APISchemaDB is the database representation of an API request/response schema.
+type APISchemaDB struct {
+	ID         string    `json:"id"`
+	ResourceID string    `json:"resource_id"`
+	SchemaType string    `json:"schema_type"`
+	SchemaJSON string    `json:"schema_json"`
+	CreatedAt  time.Time `json:"created_at"`
+}

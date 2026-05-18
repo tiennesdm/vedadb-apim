@@ -1,54 +1,52 @@
 // Package gateway provides the core API gateway functionality including rate limiting.
-// This file implements the token bucket rate limiter with support for per-API,
-// per-application, per-user, and distributed rate limiting backed by VedaDB.
+// This file implements both a local token-bucket rate limiter and a DB-backed
+// distributed rate limiter for multi-node gateway deployments.
 package gateway
 
 import (
 	"context"
-	"fmt"
+	"math"
 	"net/http"
 	"strconv"
 	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
+
+	"github.com/vedadb/vapim/pkg/store"
 )
+
+// ---------------------------------------------------------------------------
+// Rate Limiter Interface
+// ---------------------------------------------------------------------------
 
 // RateLimiter defines the interface for rate limiting implementations.
 type RateLimiter interface {
-	// Allow checks if a request is allowed under the given key and returns rate limit info.
-	Allow(ctx context.Context, key string, limit int, window time.Duration) (*RateLimitInfo, error)
-	// AllowWithBurst checks if a request is allowed with a burst capacity.
-	AllowWithBurst(ctx context.Context, key string, limit int, burst int, window time.Duration) (*RateLimitInfo, error)
-	// Reset resets the rate limiter for the given key.
+	Allow(ctx context.Context, key string, limit int, window time.Duration) (bool, int, error)
+	AllowWithBurst(ctx context.Context, key string, limit, burst int, window time.Duration) (bool, int, int, error)
 	Reset(ctx context.Context, key string) error
 }
 
 // RateLimitInfo contains rate limiting information returned to the caller.
 type RateLimitInfo struct {
-	// Allowed indicates whether the request is allowed.
-	Allowed bool `json:"allowed"`
-	// Limit is the maximum number of requests allowed in the window.
-	Limit int `json:"limit"`
-	// Remaining is the number of requests remaining in the current window.
-	Remaining int `json:"remaining"`
-	// ResetAt is the Unix timestamp when the rate limit window resets.
-	ResetAt int64 `json:"reset_at"`
-	// RetryAfter is the number of seconds to wait before retrying (only when not allowed).
+	Allowed    bool  `json:"allowed"`
+	Limit      int   `json:"limit"`
+	Remaining  int   `json:"remaining"`
+	ResetAt    int64 `json:"reset_at"`
 	RetryAfter int64 `json:"retry_after,omitempty"`
 }
 
+// ---------------------------------------------------------------------------
+// Local Token Bucket (fast path)
+// ---------------------------------------------------------------------------
+
 // TokenBucket implements a token bucket rate limiter.
 type TokenBucket struct {
-	// tokens is the current number of available tokens.
-	tokens float64
-	// lastRefill is the last time the bucket was refilled.
+	tokens     float64
 	lastRefill time.Time
-	// capacity is the maximum number of tokens (burst capacity).
-	capacity float64
-	// rate is the rate of token generation per second.
-	rate float64
-	mu   sync.Mutex
+	capacity   float64
+	rate       float64
+	mu         sync.Mutex
 }
 
 // NewTokenBucket creates a new token bucket with the given rate and burst capacity.
@@ -74,45 +72,181 @@ func (tb *TokenBucket) Allow() bool {
 	return false
 }
 
+// Remaining returns the current number of available tokens.
+func (tb *TokenBucket) Remaining() int {
+	tb.mu.Lock()
+	defer tb.mu.Unlock()
+	tb.refill()
+	return int(math.Floor(tb.tokens))
+}
+
 // refill adds tokens based on elapsed time.
 func (tb *TokenBucket) refill() {
 	now := time.Now()
 	elapsed := now.Sub(tb.lastRefill).Seconds()
-	tb.tokens += elapsed * tb.rate
-	if tb.tokens > tb.capacity {
-		tb.tokens = tb.capacity
-	}
+	tb.tokens = math.Min(tb.capacity, tb.tokens+elapsed*tb.rate)
 	tb.lastRefill = now
 }
 
-// LocalRateLimiter implements rate limiting using in-memory token buckets.
+// ---------------------------------------------------------------------------
+// DB-Backed Distributed Rate Limiter
+// ---------------------------------------------------------------------------
+
+// ThrottleStore defines the store methods needed for distributed rate limiting.
+type ThrottleStore interface {
+	store.Store
+}
+
+// bucketState holds local fast-path state for a rate limit key.
+type bucketState struct {
+	tokens     float64
+	lastRefill time.Time
+	window     time.Time
+}
+
+// DBRateLimiter implements a hybrid local-cache + DB-backed rate limiter.
+// The local cache provides sub-microsecond checks; the DB provides
+// distributed consistency across gateway instances.
+type DBRateLimiter struct {
+	store      ThrottleStore
+	localCache map[string]*bucketState
+	mu         sync.RWMutex
+}
+
+// NewDBRateLimiter creates a new DB-backed rate limiter with local fast-path caching.
+func NewDBRateLimiter(store ThrottleStore) *DBRateLimiter {
+	rl := &DBRateLimiter{
+		store:      store,
+		localCache: make(map[string]*bucketState),
+	}
+	// Start stale entry cleanup
+	go rl.cleanup()
+	return rl
+}
+
+// Allow checks if a request is allowed under the given key (no burst).
+func (r *DBRateLimiter) Allow(ctx context.Context, key string, limit int, window time.Duration) (bool, int, error) {
+	allowed, remaining, _, err := r.AllowWithBurst(ctx, key, limit, limit, window)
+	return allowed, remaining, err
+}
+
+// AllowWithBurst checks if a request is allowed with a burst capacity.
+// It first checks the local cache (fast path), then falls back to DB
+// for distributed consistency.
+func (r *DBRateLimiter) AllowWithBurst(ctx context.Context, key string, limit, burst int, window time.Duration) (bool, int, int, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	now := time.Now()
+	windowStart := now.Truncate(window)
+
+	state, exists := r.localCache[key]
+	if !exists || state.window.Before(windowStart) {
+		// New window or key doesn't exist locally
+		state = &bucketState{
+			tokens:     float64(burst),
+			lastRefill: now,
+			window:     windowStart,
+		}
+		r.localCache[key] = state
+	}
+
+	// Refill tokens based on elapsed time since last check
+	elapsed := now.Sub(state.lastRefill).Seconds()
+	ratePerSec := float64(limit) / window.Seconds()
+	state.tokens = math.Min(float64(burst), state.tokens+elapsed*ratePerSec)
+	state.lastRefill = now
+
+	if state.tokens >= 1 {
+		state.tokens--
+		remaining := int(math.Floor(state.tokens))
+		resetAt := int(windowStart.Add(window).Unix())
+		return true, remaining, resetAt, nil
+	}
+
+	// Local cache says rate limited, but check DB for distributed consistency
+	// (another instance may have decremented the shared counter)
+	dbCount, err := r.store.GetThrottleCounter(key, windowStart)
+	if err != nil {
+		// On DB error, fall back to local decision (deny)
+		return false, 0, int(windowStart.Add(window).Unix()), nil
+	}
+
+	if dbCount < limit {
+		if err := r.store.IncrementThrottleCounter(key, windowStart); err != nil {
+			return false, 0, int(windowStart.Add(window).Unix()), nil
+		}
+		newCount := dbCount + 1
+		// Update local state to match DB reality
+		state.tokens = math.Max(0, float64(burst)-float64(newCount))
+		state.lastRefill = now
+		remaining := limit - newCount
+		if remaining < 0 {
+			remaining = 0
+		}
+		return true, remaining, int(windowStart.Add(window).Unix()), nil
+	}
+
+	return false, 0, int(windowStart.Add(window).Unix()), nil
+}
+
+// Reset resets the rate limiter for the given key in both local cache and DB.
+func (r *DBRateLimiter) Reset(ctx context.Context, key string) error {
+	r.mu.Lock()
+	delete(r.localCache, key)
+	r.mu.Unlock()
+	_ = ctx
+	return r.store.ResetThrottleCounter(key)
+}
+
+// cleanup periodically removes stale token buckets older than 10 minutes.
+func (r *DBRateLimiter) cleanup() {
+	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop()
+	for range ticker.C {
+		cutoff := time.Now().Add(-10 * time.Minute)
+		r.mu.Lock()
+		for key, state := range r.localCache {
+			if state.window.Before(cutoff) {
+				delete(r.localCache, key)
+			}
+		}
+		r.mu.Unlock()
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Local-Only Rate Limiter (single-node deployments)
+// ---------------------------------------------------------------------------
+
+// LocalRateLimiter implements pure in-memory rate limiting for single-node deployments.
 type LocalRateLimiter struct {
 	buckets sync.Map // key -> *tokenBucketEntry
 }
 
 type tokenBucketEntry struct {
-	bucket    *TokenBucket
-	window    time.Duration
-	limit     int
-	resetAt   int64
-	mu        sync.Mutex
+	bucket  *TokenBucket
+	window  time.Duration
+	limit   int
+	resetAt int64
+	mu      sync.Mutex
 }
 
-// NewLocalRateLimiter creates a new local rate limiter.
+// NewLocalRateLimiter creates a new local-only rate limiter.
 func NewLocalRateLimiter() *LocalRateLimiter {
 	rl := &LocalRateLimiter{}
-	// Start cleanup goroutine to remove stale buckets
 	go rl.cleanup()
 	return rl
 }
 
 // Allow checks if a request is allowed under the given key.
-func (r *LocalRateLimiter) Allow(ctx context.Context, key string, limit int, window time.Duration) (*RateLimitInfo, error) {
-	return r.AllowWithBurst(ctx, key, limit, limit, window)
+func (r *LocalRateLimiter) Allow(ctx context.Context, key string, limit int, window time.Duration) (bool, int, error) {
+	allowed, remaining, _, err := r.AllowWithBurst(ctx, key, limit, limit, window)
+	return allowed, remaining, err
 }
 
 // AllowWithBurst checks if a request is allowed with a burst capacity.
-func (r *LocalRateLimiter) AllowWithBurst(ctx context.Context, key string, limit int, burst int, window time.Duration) (*RateLimitInfo, error) {
+func (r *LocalRateLimiter) AllowWithBurst(ctx context.Context, key string, limit int, burst int, window time.Duration) (bool, int, int, error) {
 	rate := float64(limit) / window.Seconds()
 	now := time.Now()
 	windowStart := now.Truncate(window).Add(window).Unix()
@@ -128,7 +262,6 @@ func (r *LocalRateLimiter) AllowWithBurst(ctx context.Context, key string, limit
 	entry.mu.Lock()
 	defer entry.mu.Unlock()
 
-	// Reset bucket if window has changed
 	currentWindowStart := now.Truncate(window).Add(window).Unix()
 	if currentWindowStart > entry.resetAt {
 		entry.bucket = NewTokenBucket(rate, float64(burst))
@@ -137,27 +270,14 @@ func (r *LocalRateLimiter) AllowWithBurst(ctx context.Context, key string, limit
 
 	allowed := entry.bucket.Allow()
 	remaining := int(entry.bucket.tokens)
-
-	info := &RateLimitInfo{
-		Allowed:  allowed,
-		Limit:    limit,
-		Remaining: remaining,
-		ResetAt:  entry.resetAt,
-	}
-
-	if !allowed {
-		info.RetryAfter = entry.resetAt - now.Unix()
-		if info.RetryAfter < 1 {
-			info.RetryAfter = 1
-		}
-	}
-
-	return info, nil
+	_ = ctx
+	return allowed, remaining, int(entry.resetAt), nil
 }
 
-// Reset resets the rate limiter for the given key.
+// Reset resets the rate limit for a key.
 func (r *LocalRateLimiter) Reset(ctx context.Context, key string) error {
 	r.buckets.Delete(key)
+	_ = ctx
 	return nil
 }
 
@@ -178,47 +298,35 @@ func (r *LocalRateLimiter) cleanup() {
 }
 
 // ---------------------------------------------------------------------------
-// Gateway Rate Limiting Integration
+// Gateway Middleware
 // ---------------------------------------------------------------------------
 
-// RateLimitKeys defines the context keys for rate limit information.
 const (
 	RateLimitInfoKey = "rate_limit_info"
 )
 
 // RateLimitConfig holds rate limiting configuration for the gateway.
 type RateLimitConfig struct {
-	// Enabled enables/disables rate limiting.
-	Enabled bool
-	// DefaultLimit is the default request limit per window.
-	DefaultLimit int
-	// DefaultWindow is the default rate limit window.
-	DefaultWindow time.Duration
-	// HeaderLimitName is the response header for the limit.
-	HeaderLimitName string
-	// HeaderRemainingName is the response header for remaining requests.
-	HeaderRemainingName string
-	// HeaderResetName is the response header for reset timestamp.
-	HeaderResetName string
-	// HeaderRetryAfterName is the response header for retry after.
+	Enabled              bool
+	DefaultLimit         int
+	DefaultWindow        time.Duration
+	HeaderLimitName      string
+	HeaderRemainingName  string
+	HeaderResetName      string
 	HeaderRetryAfterName string
-	// Distributed enables distributed rate limiting via VedaDB.
-	Distributed bool
-	// PerAPILimits defines limits per API context.
-	PerAPILimits map[string]APILimitConfig
-	// PerAppLimits defines limits per application tier.
-	PerAppLimits map[string]int
-	// PerUserLimits defines limits per user role.
-	PerUserLimits map[string]int
+	Distributed          bool
+	PerAPILimits         map[string]APILimitConfig
+	PerAppLimits         map[string]int
+	PerUserLimits        map[string]int
 }
 
 // APILimitConfig defines rate limits for a specific API.
 type APILimitConfig struct {
-	Limit    int
-	Burst    int
-	Window   time.Duration
-	APILimit int
-	AppLimit int
+	Limit     int
+	Burst     int
+	Window    time.Duration
+	APILimit  int
+	AppLimit  int
 	UserLimit int
 }
 
@@ -253,9 +361,9 @@ func NewRateLimiterMiddleware(limiter RateLimiter, config RateLimitConfig) *Rate
 	}
 	if config.PerAppLimits == nil {
 		config.PerAppLimits = map[string]int{
-			"Bronze":   100,
-			"Silver":   500,
-			"Gold":     2000,
+			"Bronze":    100,
+			"Silver":    500,
+			"Gold":      2000,
 			"Unlimited": 100000,
 		}
 	}
@@ -283,7 +391,7 @@ func (m *RateLimiterMiddleware) Middleware() gin.HandlerFunc {
 		key := m.buildKey(c)
 		limit, burst, window := m.resolveLimits(c)
 
-		info, err := m.limiter.AllowWithBurst(c.Request.Context(), key, limit, burst, window)
+		allowed, remaining, resetAt, err := m.limiter.AllowWithBurst(c.Request.Context(), key, limit, burst, window)
 		if err != nil {
 			c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{
 				"error": "rate limiter error",
@@ -292,23 +400,33 @@ func (m *RateLimiterMiddleware) Middleware() gin.HandlerFunc {
 		}
 
 		// Set rate limit headers
-		c.Header(m.config.HeaderLimitName, strconv.Itoa(info.Limit))
-		c.Header(m.config.HeaderRemainingName, strconv.Itoa(info.Remaining))
-		c.Header(m.config.HeaderResetName, strconv.FormatInt(info.ResetAt, 10))
+		c.Header(m.config.HeaderLimitName, strconv.Itoa(limit))
+		c.Header(m.config.HeaderRemainingName, strconv.Itoa(remaining))
+		c.Header(m.config.HeaderResetName, strconv.FormatInt(int64(resetAt), 10))
 
-		if !info.Allowed {
-			c.Header(m.config.HeaderRetryAfterName, strconv.FormatInt(info.RetryAfter, 10))
+		if !allowed {
+			retryAfter := int64(resetAt) - time.Now().Unix()
+			if retryAfter < 1 {
+				retryAfter = 1
+			}
+			c.Header(m.config.HeaderRetryAfterName, strconv.FormatInt(retryAfter, 10))
 			c.Header("X-RateLimit-Reason", "quota exceeded")
 			c.AbortWithStatusJSON(http.StatusTooManyRequests, gin.H{
-				"error":        "rate limit exceeded",
-				"limit":        info.Limit,
-				"remaining":    info.Remaining,
-				"reset_at":     info.ResetAt,
-				"retry_after":  info.RetryAfter,
+				"error":       "rate limit exceeded",
+				"limit":       limit,
+				"remaining":   remaining,
+				"reset_at":    resetAt,
+				"retry_after": retryAfter,
 			})
 			return
 		}
 
+		info := &RateLimitInfo{
+			Allowed:   allowed,
+			Limit:     limit,
+			Remaining: remaining,
+			ResetAt:   int64(resetAt),
+		}
 		c.Set(RateLimitInfoKey, info)
 		c.Next()
 	}
@@ -321,7 +439,6 @@ func (m *RateLimiterMiddleware) buildKey(c *gin.Context) string {
 	userID := c.GetString("user_id")
 	clientIP := c.ClientIP()
 
-	// Build composite key: api:app:user:ip
 	parts := []string{"rl"}
 	if apiContext != "" {
 		parts = append(parts, apiContext)
@@ -335,7 +452,14 @@ func (m *RateLimiterMiddleware) buildKey(c *gin.Context) string {
 		parts = append(parts, "user:"+userID)
 	}
 
-	return fmt.Sprintf("%s:%s:%s", apiContext, appID, userID)
+	result := ""
+	for i, p := range parts {
+		if i > 0 {
+			result += ":"
+		}
+		result += p
+	}
+	return result
 }
 
 // resolveLimits determines the appropriate rate limits for the request.
@@ -372,143 +496,13 @@ func (m *RateLimiterMiddleware) resolveLimits(c *gin.Context) (limit, burst int,
 }
 
 // ---------------------------------------------------------------------------
-// Distributed Rate Limiter (VedaDB-backed)
-// ---------------------------------------------------------------------------
-
-// DistributedRateLimiter implements rate limiting backed by VedaDB for
-// distributed gateway deployments where multiple instances share rate limits.
-type DistributedRateLimiter struct {
-	client VedaDBRateClient
-	config RateLimitConfig
-}
-
-// VedaDBRateClient defines the interface needed from VedaDB for rate limiting.
-type VedaDBRateClient interface {
-	Get(ctx context.Context, namespace, key string, dest interface{}) error
-	Set(ctx context.Context, namespace, key string, value interface{}) error
-}
-
-// rateLimitEntry represents a stored rate limit counter in VedaDB.
-type rateLimitEntry struct {
-	Count     int       `json:"count"`
-	ResetAt   int64     `json:"reset_at"`
-	Limit     int       `json:"limit"`
-	Burst     int       `json:"burst"`
-	Window    int64     `json:"window"` // nanoseconds
-	UpdatedAt time.Time `json:"updated_at"`
-}
-
-// NewDistributedRateLimiter creates a new distributed rate limiter.
-func NewDistributedRateLimiter(client VedaDBRateClient, config RateLimitConfig) *DistributedRateLimiter {
-	return &DistributedRateLimiter{
-		client: client,
-		config: config,
-	}
-}
-
-// Allow checks if a request is allowed in the distributed rate limiter.
-func (d *DistributedRateLimiter) Allow(ctx context.Context, key string, limit int, window time.Duration) (*RateLimitInfo, error) {
-	return d.AllowWithBurst(ctx, key, limit, limit, window)
-}
-
-// AllowWithBurst checks if a request is allowed with burst capacity (distributed).
-func (d *DistributedRateLimiter) AllowWithBurst(ctx context.Context, key string, limit int, burst int, window time.Duration) (*RateLimitInfo, error) {
-	namespace := "ratelimit"
-	now := time.Now()
-	windowEnd := now.Truncate(window).Add(window).Unix()
-
-	var entry rateLimitEntry
-	err := d.client.Get(ctx, namespace, key, &entry)
-	if err != nil {
-		// Key doesn't exist, create new entry
-		entry = rateLimitEntry{
-			Count:     1,
-			ResetAt:   windowEnd,
-			Limit:     limit,
-			Burst:     burst,
-			Window:    window.Nanoseconds(),
-			UpdatedAt: now,
-		}
-		if err := d.client.Set(ctx, namespace, key, entry); err != nil {
-			return nil, fmt.Errorf("failed to create rate limit entry: %w", err)
-		}
-		return &RateLimitInfo{
-			Allowed:   true,
-			Limit:     limit,
-			Remaining: burst - 1,
-			ResetAt:   windowEnd,
-		}, nil
-	}
-
-	// Check if window has expired
-	if now.Unix() >= entry.ResetAt {
-		// Reset for new window
-		entry = rateLimitEntry{
-			Count:     1,
-			ResetAt:   windowEnd,
-			Limit:     limit,
-			Burst:     burst,
-			Window:    window.Nanoseconds(),
-			UpdatedAt: now,
-		}
-		if err := d.client.Set(ctx, namespace, key, entry); err != nil {
-			return nil, fmt.Errorf("failed to reset rate limit entry: %w", err)
-		}
-		return &RateLimitInfo{
-			Allowed:   true,
-			Limit:     limit,
-			Remaining: burst - 1,
-			ResetAt:   windowEnd,
-		}, nil
-	}
-
-	// Check if over limit
-	if entry.Count >= burst {
-		return &RateLimitInfo{
-			Allowed:    false,
-			Limit:      limit,
-			Remaining:  0,
-			ResetAt:    entry.ResetAt,
-			RetryAfter: entry.ResetAt - now.Unix(),
-		}, nil
-	}
-
-	// Increment counter
-	entry.Count++
-	entry.UpdatedAt = now
-	if err := d.client.Set(ctx, namespace, key, entry); err != nil {
-		return nil, fmt.Errorf("failed to update rate limit entry: %w", err)
-	}
-
-	return &RateLimitInfo{
-		Allowed:   true,
-		Limit:     limit,
-		Remaining: burst - entry.Count,
-		ResetAt:   entry.ResetAt,
-	}, nil
-}
-
-// Reset resets the rate limit for a key.
-func (d *DistributedRateLimiter) Reset(ctx context.Context, key string) error {
-	// In distributed mode, we store a reset marker
-	return d.client.Set(ctx, "ratelimit", key, rateLimitEntry{
-		Count:     0,
-		ResetAt:   time.Now().Unix(),
-		UpdatedAt: time.Now(),
-	})
-}
-
-// ---------------------------------------------------------------------------
 // Spike Arrest (Token Drip Rate Limiter)
 // ---------------------------------------------------------------------------
 
 // SpikeArrest implements a token drip rate limiter to prevent traffic spikes.
 type SpikeArrest struct {
-	// ratePerSecond is the maximum requests per second.
 	ratePerSecond float64
-	// bucket is the token bucket.
-	bucket *TokenBucket
-	mu     sync.Mutex
+	bucket        *TokenBucket
 }
 
 // NewSpikeArrest creates a new spike arrest limiter.
@@ -532,8 +526,8 @@ func ThrottleMiddleware(ratePerSecond float64) gin.HandlerFunc {
 			c.Header("X-Throttled", "true")
 			c.Header("X-Throttle-Reason", "spike_arrest")
 			c.AbortWithStatusJSON(http.StatusTooManyRequests, gin.H{
-				"error":   "request throttled due to traffic spike",
-				"policy":  "spike_arrest",
+				"error":  "request throttled due to traffic spike",
+				"policy": "spike_arrest",
 			})
 			return
 		}

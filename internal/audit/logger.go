@@ -90,6 +90,18 @@ func (al *AuditLogger) Log(ctx context.Context, action, resourceType, resourceID
 	}
 }
 
+// InsertEntry writes a pre-built audit log entry directly to the database.
+// It bypasses the buffer for immediate persistence and is safe for concurrent use.
+func (al *AuditLogger) InsertEntry(entry *models.AuditLogDB) error {
+	if entry.ID == "" {
+		entry.ID = uuid.New().String()
+	}
+	if entry.Timestamp.IsZero() {
+		entry.Timestamp = time.Now().UTC()
+	}
+	return al.store.InsertAuditLog(entry)
+}
+
 // worker is the background goroutine that drains the buffer and writes
 // entries to the database one at a time.
 func (al *AuditLogger) worker() {
