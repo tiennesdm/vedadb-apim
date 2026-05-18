@@ -125,6 +125,10 @@ type Store interface {
 	ListWebhooks(tenantID string) ([]*models.WebhookDB, error)
 	DeleteWebhook(id string) error
 
+	// Webhook Deliveries
+	CreateWebhookDelivery(d *models.WebhookDeliveryDB) error
+	UpdateWebhookDelivery(d *models.WebhookDeliveryDB) error
+
 	// Migrations
 	RunMigration(name, sql string) error
 	GetAppliedMigrations() ([]string, error)
@@ -1253,6 +1257,26 @@ func (s *VedaDBStore) ListWebhooks(tenantID string) ([]*models.WebhookDB, error)
 func (s *VedaDBStore) DeleteWebhook(id string) error {
 	q := `DELETE FROM webhooks WHERE id = ?`
 	_, err := s.exec(context.Background(), q, id)
+	return err
+}
+
+// ---------------------------------------------------------------------------
+// Webhook Deliveries
+// ---------------------------------------------------------------------------
+
+func (s *VedaDBStore) CreateWebhookDelivery(d *models.WebhookDeliveryDB) error {
+	q := `INSERT INTO webhook_deliveries (id, webhook_id, event_type, payload, response_status, response_body, attempt_count, status, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+	_, err := s.exec(context.Background(), q,
+		d.ID, d.WebhookID, d.EventType, d.Payload, d.ResponseStatus, d.ResponseBody,
+		d.AttemptCount, d.Status, d.CreatedAt)
+	return err
+}
+
+func (s *VedaDBStore) UpdateWebhookDelivery(d *models.WebhookDeliveryDB) error {
+	q := `UPDATE webhook_deliveries SET response_status = ?, response_body = ?, attempt_count = ?, status = ? WHERE id = ?`
+	_, err := s.exec(context.Background(), q,
+		d.ResponseStatus, d.ResponseBody, d.AttemptCount, d.Status, d.ID)
 	return err
 }
 

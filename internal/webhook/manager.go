@@ -1,443 +1,245 @@
-// Package webhook provides webhook management for the VedaDB API Manager.
+// Package webhook provides webhook registration, event delivery, and
+// subscription management for the VedaDB API Manager.
 package webhook
 
 import (
 	"context"
-	"database/sql"
 	"fmt"
+	"strings"
 	"time"
 
-	"github.com/google/uuid"
-	"github.com/vedadb/vapim/internal/tenant"
+	"go.uber.org/zap"
+
 	"github.com/vedadb/vapim/pkg/models"
+	"github.com/vedadb/vapim/pkg/store"
 )
 
-// SQLStore defines the database interface used by the webhook manager.
-type SQLStore interface {
-	QueryContext(ctx context.Context, query string, args ...interface{}) (*sql.Rows, error)
-	QueryRowContext(ctx context.Context, query string, args ...interface{}) *sql.Row
-	ExecContext(ctx context.Context, query string, args ...interface{}) (sql.Result, error)
+// Manager handles the lifecycle of webhooks: registration, unregistration,
+// and event delivery. It uses a Deliverer for reliable HTTP transmission and
+// a Store for persistence.
+type Manager struct {
+	store     store.Store
+	deliverer *Deliverer
+	logger    *zap.Logger
 }
 
-// WebhookManager defines the interface for webhook management operations.
-type WebhookManager interface {
-	// Register creates a new webhook registration.
-	Register(ctx context.Context, webhook *models.Webhook) error
-	// Unregister removes a webhook registration by ID.
-	Unregister(ctx context.Context, id string) error
-	// Deliver sends a payload to all registered webhooks matching the event type.
-	Deliver(eventType string, payload map[string]interface{}) error
-	// ListByAPI returns all webhooks registered for a specific API.
-	ListByAPI(ctx context.Context, apiID string) ([]*models.Webhook, error)
-	// ListAll returns all webhooks for the current tenant.
-	ListAll(ctx context.Context) ([]*models.Webhook, error)
-	// ListDeliveries returns recent delivery attempts for a webhook.
-	ListDeliveries(ctx context.Context, webhookID string, limit int) ([]*models.WebhookDelivery, error)
-	// RetryDelivery re-attempts a failed delivery.
-	RetryDelivery(ctx context.Context, deliveryID string) error
-	// GetWebhook retrieves a single webhook by ID.
-	GetWebhook(ctx context.Context, id string) (*models.Webhook, error)
-	// UpdateWebhook updates an existing webhook.
-	UpdateWebhook(ctx context.Context, webhook *models.Webhook) error
-	// ToggleWebhook activates or deactivates a webhook.
-	ToggleWebhook(ctx context.Context, id string, active bool) error
-}
-
-// Ensure DefaultManager implements WebhookManager.
-var _ WebhookManager = (*DefaultManager)(nil)
-
-// DefaultManager is the production implementation of WebhookManager.
-type DefaultManager struct {
-	store     SQLStore
-	deliverer Deliverer
-}
-
-// NewManager creates a new webhook manager.
-func NewManager(store SQLStore, deliverer Deliverer) *DefaultManager {
-	return &DefaultManager{
-		store:     store,
-		deliverer: deliverer,
+// NewManager creates a new Manager backed by the given store and logger. An
+// internal Deliverer is created automatically.
+func NewManager(st store.Store, logger *zap.Logger) *Manager {
+	if logger == nil {
+		logger = zap.NewNop()
+	}
+	return &Manager{
+		store:     st,
+		deliverer: NewDeliverer(st, logger),
+		logger:    logger,
 	}
 }
 
-// Register creates a new webhook in the database.
-func (m *DefaultManager) Register(ctx context.Context, webhook *models.Webhook) error {
-	if webhook == nil {
-		return fmt.Errorf("webhook is nil")
+// Register creates a new webhook subscription for the given API. The webhook
+// will receive HTTP POST requests for each event type listed in Events.
+func (m *Manager) Register(apiID, name, url string, events []string, secret string, headers map[string]string) (*models.Webhook, error) {
+	if apiID == "" {
+		return nil, fmt.Errorf("apiID is required")
 	}
-	if webhook.Name == "" {
-		return fmt.Errorf("webhook name is required")
+	if url == "" {
+		return nil, fmt.Errorf("webhook URL is required")
 	}
-	if webhook.CallbackURL == "" {
-		return fmt.Errorf("webhook callback URL is required")
-	}
-	if len(webhook.EventTypes) == 0 {
-		return fmt.Errorf("at least one event type is required")
+	if len(events) == 0 {
+		return nil, fmt.Errorf("at least one event type is required")
 	}
 
-	// Validate event types
-	for _, et := range webhook.EventTypes {
-		if !IsValidEventType(et) {
-			return fmt.Errorf("invalid event type: %s", et)
-		}
+	wh := &models.WebhookDB{
+		ID:        generateID(),
+		APIID:     apiID,
+		URL:       url,
+		Events:    strings.Join(events, ","),
+		Secret:    secret,
+		Status:    "active",
+		CreatedAt: time.Now(),
+		UpdatedAt: time.Now(),
 	}
 
-	webhook.ID = uuid.New().String()
-	webhook.Active = true
-	webhook.TenantID = tenant.TenantIDFromContext(ctx)
-	webhook.CreatedAt = time.Now().UTC()
-	webhook.UpdatedAt = webhook.CreatedAt
-
-	query := `
-		INSERT INTO webhooks (id, api_id, name, callback_url, secret, event_types, active, tenant_id, created_at, updated_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-	`
-
-	var apiID interface{}
-	if webhook.APIID != nil {
-		apiID = *webhook.APIID
-	} else {
-		apiID = nil
-	}
-
-	_, err := m.store.ExecContext(ctx, query,
-		webhook.ID, apiID, webhook.Name, webhook.CallbackURL,
-		webhook.Secret, webhook.EventTypes, webhook.Active,
-		webhook.TenantID, webhook.CreatedAt, webhook.UpdatedAt,
-	)
-	if err != nil {
-		return fmt.Errorf("insert webhook: %w", err)
-	}
-
-	return nil
-}
-
-// Unregister soft-deletes a webhook by setting it inactive.
-func (m *DefaultManager) Unregister(ctx context.Context, id string) error {
-	query := `
-		UPDATE webhooks SET active = false, updated_at = $1
-		WHERE id = $2 AND tenant_id = $3
-	`
-	result, err := m.store.ExecContext(ctx, query, time.Now().UTC(), id, tenant.TenantIDFromContext(ctx))
-	if err != nil {
-		return fmt.Errorf("deactivate webhook: %w", err)
-	}
-
-	rowsAffected, err := result.RowsAffected()
-	if err != nil {
-		return fmt.Errorf("check rows affected: %w", err)
-	}
-	if rowsAffected == 0 {
-		return fmt.Errorf("webhook not found: %s", id)
-	}
-
-	return nil
-}
-
-// Deliver sends the event payload to all active webhooks subscribed to the event type.
-func (m *DefaultManager) Deliver(eventType string, payload map[string]interface{}) error {
-	ctx := context.Background()
-
-	// Find all active webhooks that subscribe to this event type
-	query := `
-		SELECT id, api_id, name, callback_url, secret, event_types, active, tenant_id, created_at, updated_at
-		FROM webhooks
-		WHERE active = true AND $1 = ANY(event_types)
-	`
-
-	rows, err := m.store.QueryContext(ctx, query, eventType)
-	if err != nil {
-		return fmt.Errorf("query webhooks for event %s: %w", eventType, err)
-	}
-	defer rows.Close()
-
-	var webhooks []*models.Webhook
-	for rows.Next() {
-		wh := &models.Webhook{}
-		var apiID sql.NullString
-		err := rows.Scan(
-			&wh.ID, &apiID, &wh.Name, &wh.CallbackURL, &wh.Secret,
-			&wh.EventTypes, &wh.Active, &wh.TenantID, &wh.CreatedAt, &wh.UpdatedAt,
+	if err := m.store.CreateWebhook(wh); err != nil {
+		m.logger.Error("failed to persist webhook",
+			zap.String("api_id", apiID),
+			zap.String("url", url),
+			zap.Error(err),
 		)
-		if err != nil {
+		return nil, fmt.Errorf("create webhook in store: %w", err)
+	}
+
+	result := dbToWebhook(wh)
+	result.Name = name
+	result.Headers = headers
+	m.logger.Info("webhook registered",
+		zap.String("webhook_id", result.ID),
+		zap.String("api_id", apiID),
+		zap.String("url", url),
+		zap.Strings("events", events),
+	)
+	return result, nil
+}
+
+// Unregister deletes a webhook by its ID. Returns an error if the webhook
+// does not exist or the store operation fails.
+func (m *Manager) Unregister(webhookID string) error {
+	if webhookID == "" {
+		return fmt.Errorf("webhookID is required")
+	}
+	if err := m.store.DeleteWebhook(webhookID); err != nil {
+		m.logger.Error("failed to delete webhook",
+			zap.String("webhook_id", webhookID),
+			zap.Error(err),
+		)
+		return fmt.Errorf("delete webhook %s: %w", webhookID, err)
+	}
+	m.logger.Info("webhook unregistered", zap.String("webhook_id", webhookID))
+	return nil
+}
+
+// List returns all webhooks for a given tenant.
+func (m *Manager) List(tenantID string) ([]*models.Webhook, error) {
+	dbHooks, err := m.store.ListWebhooks(tenantID)
+	if err != nil {
+		m.logger.Error("failed to list webhooks",
+			zap.String("tenant_id", tenantID),
+			zap.Error(err),
+		)
+		return nil, fmt.Errorf("list webhooks: %w", err)
+	}
+	result := make([]*models.Webhook, 0, len(dbHooks))
+	for _, h := range dbHooks {
+		result = append(result, dbToWebhook(h))
+	}
+	return result, nil
+}
+
+// ListByAPI returns all webhooks registered for a specific API.
+func (m *Manager) ListByAPI(apiID string) ([]*models.Webhook, error) {
+	dbHooks, err := m.store.GetWebhooksByAPI(apiID)
+	if err != nil {
+		m.logger.Error("failed to list webhooks by API",
+			zap.String("api_id", apiID),
+			zap.Error(err),
+		)
+		return nil, fmt.Errorf("list webhooks by API %s: %w", apiID, err)
+	}
+	result := make([]*models.Webhook, 0, len(dbHooks))
+	for _, h := range dbHooks {
+		result = append(result, dbToWebhook(h))
+	}
+	return result, nil
+}
+
+// Deliver looks up all active webhooks registered for the given API and
+// delivers the event payload to each one asynchronously via the Deliverer.
+// Returns the number of webhooks that the event was dispatched to.
+func (m *Manager) Deliver(apiID, eventType string, payload map[string]interface{}) (int, error) {
+	if apiID == "" {
+		return 0, fmt.Errorf("apiID is required")
+	}
+
+	hooks, err := m.store.GetWebhooksByAPI(apiID)
+	if err != nil {
+		m.logger.Error("failed to fetch webhooks for delivery",
+			zap.String("api_id", apiID),
+			zap.String("event_type", eventType),
+			zap.Error(err),
+		)
+		return 0, fmt.Errorf("fetch webhooks for API %s: %w", apiID, err)
+	}
+
+	dispatched := 0
+	for _, h := range hooks {
+		// Skip inactive webhooks.
+		if h.Status != "active" {
 			continue
 		}
-		if apiID.Valid {
-			wh.APIID = &apiID.String
+
+		wh := dbToWebhook(h)
+
+		// Filter by event type if the webhook specifies events.
+		if !shouldDeliver(wh, eventType) {
+			continue
 		}
-		webhooks = append(webhooks, wh)
+
+		if err := m.deliverer.Deliver(wh, eventType, payload); err != nil {
+			m.logger.Error("failed to dispatch webhook event",
+				zap.String("webhook_id", wh.ID),
+				zap.String("event_type", eventType),
+				zap.Error(err),
+			)
+			continue
+		}
+		dispatched++
 	}
 
-	// Deliver to each webhook asynchronously
-	for _, wh := range webhooks {
-		wh := wh // capture range variable
-		go func() {
-			ctx := tenant.WithTenant(ctx, &models.Tenant{ID: wh.TenantID, Slug: wh.TenantID})
-			if err := m.deliverer.Deliver(ctx, wh, eventType, payload); err != nil {
-				// Delivery errors are tracked in the delivery records
-				_ = err
-			}
-		}()
-	}
-
-	return nil
-}
-
-// ListByAPI returns all webhooks for a specific API.
-func (m *DefaultManager) ListByAPI(ctx context.Context, apiID string) ([]*models.Webhook, error) {
-	query := `
-		SELECT id, api_id, name, callback_url, secret, event_types, active, tenant_id, created_at, updated_at
-		FROM webhooks
-		WHERE api_id = $1 AND tenant_id = $2 AND active = true
-		ORDER BY created_at DESC
-	`
-
-	rows, err := m.store.QueryContext(ctx, query, apiID, tenant.TenantIDFromContext(ctx))
-	if err != nil {
-		return nil, fmt.Errorf("query webhooks by API: %w", err)
-	}
-	defer rows.Close()
-
-	return scanWebhooks(rows)
-}
-
-// ListAll returns all webhooks for the current tenant.
-func (m *DefaultManager) ListAll(ctx context.Context) ([]*models.Webhook, error) {
-	query := `
-		SELECT id, api_id, name, callback_url, secret, event_types, active, tenant_id, created_at, updated_at
-		FROM webhooks
-		WHERE tenant_id = $1
-		ORDER BY created_at DESC
-	`
-
-	rows, err := m.store.QueryContext(ctx, query, tenant.TenantIDFromContext(ctx))
-	if err != nil {
-		return nil, fmt.Errorf("query all webhooks: %w", err)
-	}
-	defer rows.Close()
-
-	return scanWebhooks(rows)
-}
-
-// GetWebhook retrieves a single webhook by ID.
-func (m *DefaultManager) GetWebhook(ctx context.Context, id string) (*models.Webhook, error) {
-	query := `
-		SELECT id, api_id, name, callback_url, secret, event_types, active, tenant_id, created_at, updated_at
-		FROM webhooks
-		WHERE id = $1 AND tenant_id = $2
-	`
-
-	wh := &models.Webhook{}
-	var apiID sql.NullString
-	err := m.store.QueryRowContext(ctx, query, id, tenant.TenantIDFromContext(ctx)).Scan(
-		&wh.ID, &apiID, &wh.Name, &wh.CallbackURL, &wh.Secret,
-		&wh.EventTypes, &wh.Active, &wh.TenantID, &wh.CreatedAt, &wh.UpdatedAt,
+	m.logger.Debug("webhook delivery completed",
+		zap.String("api_id", apiID),
+		zap.String("event_type", eventType),
+		zap.Int("dispatched", dispatched),
+		zap.Int("total_hooks", len(hooks)),
 	)
-	if err != nil {
-		if err == sql.ErrNoRows {
-			return nil, fmt.Errorf("webhook not found: %s", id)
-		}
-		return nil, fmt.Errorf("get webhook: %w", err)
-	}
-	if apiID.Valid {
-		wh.APIID = &apiID.String
-	}
-
-	return wh, nil
+	return dispatched, nil
 }
 
-// UpdateWebhook updates an existing webhook.
-func (m *DefaultManager) UpdateWebhook(ctx context.Context, webhook *models.Webhook) error {
-	if webhook == nil || webhook.ID == "" {
-		return fmt.Errorf("webhook ID is required")
-	}
-
-	query := `
-		UPDATE webhooks SET
-			name = $1,
-			callback_url = $2,
-			secret = $3,
-			event_types = $4,
-			active = $5,
-			updated_at = $6
-		WHERE id = $7 AND tenant_id = $8
-	`
-
-	result, err := m.store.ExecContext(ctx, query,
-		webhook.Name, webhook.CallbackURL, webhook.Secret,
-		webhook.EventTypes, webhook.Active, time.Now().UTC(),
-		webhook.ID, tenant.TenantIDFromContext(ctx),
-	)
-	if err != nil {
-		return fmt.Errorf("update webhook: %w", err)
-	}
-
-	rowsAffected, _ := result.RowsAffected()
-	if rowsAffected == 0 {
-		return fmt.Errorf("webhook not found or no changes: %s", webhook.ID)
-	}
-
-	return nil
+// DeliverWithContext delivers a webhook event using context for cancellation.
+// It behaves identically to Deliver but accepts a context for potential
+// future use (e.g. timeouts or tracing).
+func (m *Manager) DeliverWithContext(_ context.Context, apiID, eventType string, payload map[string]interface{}) (int, error) {
+	return m.Deliver(apiID, eventType, payload)
 }
 
-// ToggleWebhook activates or deactivates a webhook.
-func (m *DefaultManager) ToggleWebhook(ctx context.Context, id string, active bool) error {
-	query := `
-		UPDATE webhooks SET active = $1, updated_at = $2
-		WHERE id = $3 AND tenant_id = $4
-	`
-	result, err := m.store.ExecContext(ctx, query, active, time.Now().UTC(), id, tenant.TenantIDFromContext(ctx))
-	if err != nil {
-		return fmt.Errorf("toggle webhook: %w", err)
-	}
-
-	rowsAffected, _ := result.RowsAffected()
-	if rowsAffected == 0 {
-		return fmt.Errorf("webhook not found: %s", id)
-	}
-
-	return nil
+// SetDeliverer replaces the default Deliverer. Useful for tests.
+func (m *Manager) SetDeliverer(d *Deliverer) {
+	m.deliverer = d
 }
 
-// ListDeliveries returns recent delivery attempts for a webhook.
-func (m *DefaultManager) ListDeliveries(ctx context.Context, webhookID string, limit int) ([]*models.WebhookDelivery, error) {
-	if limit <= 0 || limit > 1000 {
-		limit = 100
+// Shutdown waits for all in-flight deliveries to complete.
+func (m *Manager) Shutdown() {
+	if m.deliverer != nil {
+		m.deliverer.Wait()
 	}
-
-	query := `
-		SELECT id, webhook_id, event_type, payload, status, http_status, response_body,
-		       error_message, attempt_count, next_retry_at, completed_at, tenant_id, created_at
-		FROM webhook_deliveries
-		WHERE webhook_id = $1 AND tenant_id = $2
-		ORDER BY created_at DESC
-		LIMIT $3
-	`
-
-	rows, err := m.store.QueryContext(ctx, query, webhookID, tenant.TenantIDFromContext(ctx), limit)
-	if err != nil {
-		return nil, fmt.Errorf("query deliveries: %w", err)
-	}
-	defer rows.Close()
-
-	return scanDeliveries(rows)
 }
 
-// RetryDelivery re-attempts a failed delivery.
-func (m *DefaultManager) RetryDelivery(ctx context.Context, deliveryID string) error {
-	// Fetch the delivery record
-	delivery, err := m.getDelivery(ctx, deliveryID)
-	if err != nil {
-		return err
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+// shouldDeliver returns true if the webhook should receive the given event
+// type. An empty event list on the webhook means it subscribes to all events.
+func shouldDeliver(wh *models.Webhook, eventType string) bool {
+	if len(wh.Events) == 0 {
+		return true
 	}
-
-	// Fetch the associated webhook
-	webhook, err := m.GetWebhook(ctx, delivery.WebhookID)
-	if err != nil {
-		return fmt.Errorf("get webhook for retry: %w", err)
+	for _, e := range wh.Events {
+		if e == eventType || e == "*" {
+			return true
+		}
 	}
-
-	// Reset delivery status and re-attempt
-	updateQuery := `
-		UPDATE webhook_deliveries
-		SET status = 'PENDING', attempt_count = attempt_count + 1, error_message = NULL, completed_at = NULL
-		WHERE id = $1
-	`
-	_, err = m.store.ExecContext(ctx, updateQuery, deliveryID)
-	if err != nil {
-		return fmt.Errorf("reset delivery for retry: %w", err)
-	}
-
-	// Re-deliver
-	go m.deliverer.Deliver(ctx, webhook, delivery.EventType, delivery.Payload)
-
-	return nil
+	return false
 }
 
-// getDelivery retrieves a single delivery record by ID.
-func (m *DefaultManager) getDelivery(ctx context.Context, deliveryID string) (*models.WebhookDelivery, error) {
-	query := `
-		SELECT id, webhook_id, event_type, payload, status, http_status, response_body,
-		       error_message, attempt_count, next_retry_at, completed_at, tenant_id, created_at
-		FROM webhook_deliveries
-		WHERE id = $1 AND tenant_id = $2
-	`
-
-	rows, err := m.store.QueryContext(ctx, query, deliveryID, tenant.TenantIDFromContext(ctx))
-	if err != nil {
-		return nil, fmt.Errorf("query delivery: %w", err)
+// dbToWebhook converts a database webhook model to the business model.
+func dbToWebhook(db *models.WebhookDB) *models.Webhook {
+	events := []string{}
+	if db.Events != "" {
+		events = strings.Split(db.Events, ",")
 	}
-	defer rows.Close()
-
-	deliveries, err := scanDeliveries(rows)
-	if err != nil {
-		return nil, err
+	active := db.Status == "active"
+	return &models.Webhook{
+		ID:        db.ID,
+		URL:       db.URL,
+		Events:    events,
+		Active:    active,
+		Secret:    db.Secret,
+		CreatedAt: db.CreatedAt,
+		UpdatedAt: db.UpdatedAt,
 	}
-	if len(deliveries) == 0 {
-		return nil, fmt.Errorf("delivery not found: %s", deliveryID)
-	}
-
-	return deliveries[0], nil
 }
 
-// scanWebhooks scans rows into webhook models.
-func scanWebhooks(rows *sql.Rows) ([]*models.Webhook, error) {
-	var webhooks []*models.Webhook
-	for rows.Next() {
-		wh := &models.Webhook{}
-		var apiID sql.NullString
-		err := rows.Scan(
-			&wh.ID, &apiID, &wh.Name, &wh.CallbackURL, &wh.Secret,
-			&wh.EventTypes, &wh.Active, &wh.TenantID, &wh.CreatedAt, &wh.UpdatedAt,
-		)
-		if err != nil {
-			return nil, fmt.Errorf("scan webhook: %w", err)
-		}
-		if apiID.Valid {
-			wh.APIID = &apiID.String
-		}
-		webhooks = append(webhooks, wh)
-	}
-	return webhooks, rows.Err()
-}
-
-// scanDeliveries scans rows into delivery models.
-func scanDeliveries(rows *sql.Rows) ([]*models.WebhookDelivery, error) {
-	var deliveries []*models.WebhookDelivery
-	for rows.Next() {
-		d := &models.WebhookDelivery{}
-		var httpStatus sql.NullInt32
-		var responseBody sql.NullString
-		var errorMsg sql.NullString
-		var nextRetry sql.NullTime
-		var completedAt sql.NullTime
-
-		err := rows.Scan(
-			&d.ID, &d.WebhookID, &d.EventType, &d.Payload,
-			&d.Status, &httpStatus, &responseBody, &errorMsg,
-			&d.AttemptCount, &nextRetry, &completedAt,
-			&d.TenantID, &d.CreatedAt,
-		)
-		if err != nil {
-			return nil, fmt.Errorf("scan delivery: %w", err)
-		}
-		if httpStatus.Valid {
-			s := int(httpStatus.Int32)
-			d.HTTPStatus = &s
-		}
-		if responseBody.Valid {
-			d.ResponseBody = &responseBody.String
-		}
-		if errorMsg.Valid {
-			d.ErrorMessage = &errorMsg.String
-		}
-		if nextRetry.Valid {
-			d.NextRetryAt = &nextRetry.Time
-		}
-		if completedAt.Valid {
-			d.CompletedAt = &completedAt.Time
-		}
-		deliveries = append(deliveries, d)
-	}
-	return deliveries, rows.Err()
+// generateID creates a short unique identifier for webhook records.
+func generateID() string {
+	return fmt.Sprintf("wh_%d", time.Now().UnixNano())
 }

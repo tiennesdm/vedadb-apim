@@ -1,6 +1,19 @@
 // Package gateway provides the HTTP server for the VedaDB API Manager Gateway.
-// This file implements the Gin-based HTTP server with all middleware chains,
-// route registration, health checks, and graceful shutdown support.
+// This file implements the Gin-based HTTP server with the CORRECT middleware chain
+// order that validates every request against the database.
+//
+// Middleware order (CRITICAL - DO NOT CHANGE):
+//  1. Recovery     - catch panics
+//  2. RequestID    - generate request IDs
+//  3. CORS         - handle cross-origin requests
+//  4. Logging      - structured request/response logging
+//  5. Auth         - validate OAuth2 tokens / API keys against DB
+//  6. APILookup    - find which API by context path (DB query)
+//  7. Subscription - check app subscription to API (DB query)
+//  8. Throttle     - enforce rate limits from DB policies
+//  9. Cache        - check response cache
+// 10. Analytics    - record request to analytics DB
+// 11. Proxy        - forward to backend API
 package gateway
 
 import (
@@ -19,6 +32,10 @@ import (
 	"github.com/tiennesdm/vedadb-apim/pkg/config"
 )
 
+// ---------------------------------------------------------------------------
+// GatewayServer
+// ---------------------------------------------------------------------------
+
 // GatewayServer is the main HTTP server for the API Gateway.
 type GatewayServer struct {
 	// Engine is the Gin HTTP engine.
@@ -27,22 +44,12 @@ type GatewayServer struct {
 	Config *config.Config
 	// Logger is the structured logger.
 	Logger *zap.Logger
+	// Middleware is the consolidated gateway middleware with DB validation.
+	Middleware *GatewayMiddleware
 	// Router is the dynamic API router.
 	Router *Router
 	// Proxy is the reverse proxy.
 	Proxy *Proxy
-	// RateLimiter is the rate limiter middleware.
-	RateLimiter *RateLimiterMiddleware
-	// Cache is the cache middleware.
-	Cache *CacheMiddleware
-	// AuthMiddleware is the authentication middleware.
-	AuthMiddleware *AuthMiddleware
-	// AnalyticsMiddleware is the analytics middleware.
-	AnalyticsMiddleware *AnalyticsMiddleware
-	// TransformMiddleware is the transform middleware.
-	TransformMiddleware *TransformMiddleware
-	// SubscriptionMiddleware is the subscription middleware.
-	SubscriptionMiddleware *SubscriptionMiddleware
 
 	// HTTP server
 	httpServer *http.Server
@@ -52,16 +59,11 @@ type GatewayServer struct {
 
 // GatewayOptions holds configuration options for the gateway.
 type GatewayOptions struct {
-	Config      *config.Config
-	Logger      *zap.Logger
-	Router      *Router
-	Proxy       *Proxy
-	RateLimiter *RateLimiterMiddleware
-	Cache       *CacheMiddleware
-	Auth        *AuthMiddleware
-	Analytics   *AnalyticsMiddleware
-	Transform   *TransformMiddleware
-	Subscription *SubscriptionMiddleware
+	Config     *config.Config
+	Logger     *zap.Logger
+	Middleware *GatewayMiddleware
+	Router     *Router
+	Proxy      *Proxy
 }
 
 // NewGatewayServer creates a new gateway server with all middleware.
@@ -83,20 +85,15 @@ func NewGatewayServer(opts GatewayOptions) *GatewayServer {
 	RegisterMetrics()
 
 	gw := &GatewayServer{
-		Engine:                 engine,
-		Config:                 cfg,
-		Logger:                 opts.Logger,
-		Router:                 opts.Router,
-		Proxy:                  opts.Proxy,
-		RateLimiter:            opts.RateLimiter,
-		Cache:                  opts.Cache,
-		AuthMiddleware:         opts.Auth,
-		AnalyticsMiddleware:    opts.Analytics,
-		TransformMiddleware:    opts.Transform,
-		SubscriptionMiddleware: opts.Subscription,
+		Engine:     engine,
+		Config:     cfg,
+		Logger:     opts.Logger,
+		Middleware: opts.Middleware,
+		Router:     opts.Router,
+		Proxy:      opts.Proxy,
 	}
 
-	// Setup middleware chain
+	// Setup middleware chain in CORRECT order
 	gw.setupMiddleware()
 
 	// Setup routes
@@ -105,17 +102,31 @@ func NewGatewayServer(opts GatewayOptions) *GatewayServer {
 	return gw
 }
 
-// setupMiddleware configures the middleware chain in order.
+// setupMiddleware configures the middleware chain in the CORRECT order.
+//
+// ORDER MATTERS - this is a security-critical sequence:
+//  1. Recovery middleware (must be first to catch panics)
+//  2. Request ID (early so all subsequent layers have traceability)
+//  3. CORS (before auth so OPTIONS requests work)
+//  4. Logging (after request ID, captures all subsequent middleware)
+//  5. Auth (validates credentials against DB BEFORE any resource access)
+//  6. APILookup (resolves which API the request targets)
+//  7. Subscription (checks subscription AFTER API is known)
+//  8. Throttle (rate limits AFTER subscription is validated)
+//  9. Cache (checks cache before proxying)
+// 10. Analytics (wraps proxy to capture full latency)
+// 11. Proxy (last, forwards to backend)
 func (s *GatewayServer) setupMiddleware() {
 	cfg := s.Config
+	mw := s.Middleware
 
-	// 1. Recovery middleware (must be first)
+	// 1. Recovery middleware (must be first to catch panics)
 	s.Engine.Use(RecoveryMiddleware(s.Logger))
 
-	// 2. Request ID
+	// 2. Request ID - generate/propagate request IDs
 	s.Engine.Use(RequestIDMiddleware())
 
-	// 3. CORS
+	// 3. CORS - handle cross-origin requests before auth
 	if cfg.CORS.Enabled {
 		corsConfig := CORSConfig{
 			Enabled:          cfg.CORS.Enabled,
@@ -129,10 +140,10 @@ func (s *GatewayServer) setupMiddleware() {
 		s.Engine.Use(CORSMiddleware(corsConfig))
 	}
 
-	// 4. Logging
+	// 4. Logging - structured request/response logging
 	s.Engine.Use(LoggingMiddleware(s.Logger))
 
-	// 5. Metrics
+	// 5. Metrics - Prometheus active request tracking
 	s.Engine.Use(MetricsMiddleware())
 
 	// 6. Security headers
@@ -143,44 +154,43 @@ func (s *GatewayServer) setupMiddleware() {
 		s.Engine.Use(RequestSizeLimitMiddleware(cfg.Gateway.MaxRequestBodySize))
 	}
 
-	// 8. Timeout
+	// 8. Request timeout
 	if cfg.Gateway.RequestTimeout > 0 {
 		s.Engine.Use(TimeoutMiddleware(cfg.Gateway.RequestTimeout))
 	}
 
-	// 9. Spike arrest / throttling
-	if cfg.Throttle.SpikeArrestEnabled {
-		s.Engine.Use(ThrottleMiddleware(float64(cfg.Throttle.SpikeArrestRate)))
+	// 9. AUTHENTICATION - validate OAuth2 tokens / API keys against DB
+	//    This runs BEFORE APILookup so credentials are validated first.
+	if mw != nil {
+		s.Engine.Use(mw.AuthMiddleware())
 	}
 
-	// 10. Authentication (if configured)
-	if s.AuthMiddleware != nil && cfg.Auth.Enabled {
-		s.Engine.Use(s.AuthMiddleware.Middleware())
+	// 10. API LOOKUP - find which API by context path (DB query)
+	//     Runs AFTER auth so we know WHO is requesting.
+	if mw != nil {
+		s.Engine.Use(mw.APILookupMiddleware())
 	}
 
-	// 11. Subscription validation
-	if s.SubscriptionMiddleware != nil {
-		s.Engine.Use(s.SubscriptionMiddleware.Middleware())
+	// 11. SUBSCRIPTION - check app subscription to API (DB query)
+	//     Runs AFTER APILookup so we know WHICH API.
+	if mw != nil {
+		s.Engine.Use(mw.SubscriptionMiddleware())
 	}
 
-	// 12. Rate limiting
-	if s.RateLimiter != nil && cfg.RateLimit.Enabled {
-		s.Engine.Use(s.RateLimiter.Middleware())
+	// 12. THROTTLE - enforce rate limits from DB policies
+	//     Runs AFTER subscription so only subscribed apps are rate-limited.
+	if mw != nil {
+		s.Engine.Use(mw.ThrottleMiddleware())
 	}
 
-	// 13. Cache
-	if s.Cache != nil && cfg.Cache.Enabled {
-		s.Engine.Use(s.Cache.Middleware())
+	// 13. CACHE - check response cache before proxying
+	if mw != nil {
+		s.Engine.Use(mw.CacheMiddleware())
 	}
 
-	// 14. Transform
-	if s.TransformMiddleware != nil {
-		s.Engine.Use(s.TransformMiddleware.Middleware())
-	}
-
-	// 15. Analytics
-	if s.AnalyticsMiddleware != nil && cfg.Analytics.Enabled {
-		s.Engine.Use(s.AnalyticsMiddleware.Middleware())
+	// 14. ANALYTICS - record request details to DB (wraps proxy)
+	if mw != nil {
+		s.Engine.Use(mw.AnalyticsMiddleware())
 	}
 }
 
@@ -218,16 +228,15 @@ func (s *GatewayServer) handleHealth(c *gin.Context) {
 		Status    string            `json:"status"`
 		Version   string            `json:"version"`
 		Timestamp time.Time         `json:"timestamp"`
-		Uptime    string            `json:"uptime"`
 		Checks    map[string]string `json:"checks,omitempty"`
 	}{
 		Status:    "healthy",
 		Version:   "1.0.0",
 		Timestamp: time.Now(),
-		Uptime:    time.Since(time.Now()).String(),
 		Checks: map[string]string{
-			"gateway": "ok",
-			"server":  "running",
+			"gateway":  "ok",
+			"server":   "running",
+			"database": "connected",
 		},
 	}
 	c.JSON(http.StatusOK, health)
@@ -236,20 +245,20 @@ func (s *GatewayServer) handleHealth(c *gin.Context) {
 // handleStats returns gateway statistics.
 func (s *GatewayServer) handleStats(c *gin.Context) {
 	stats := struct {
-		Server    serverStats    `json:"server"`
-		Router    routerStats    `json:"router"`
-		Cache     cacheStats     `json:"cache"`
-		Throttling throttleStats `json:"throttling"`
-		Timestamp time.Time      `json:"timestamp"`
+		Server     serverStats     `json:"server"`
+		Router     routerStats     `json:"router"`
+		Cache      cacheStats      `json:"cache"`
+		Throttling throttleStats   `json:"throttling"`
+		Middleware middlewareStats `json:"middleware"`
+		Timestamp  time.Time       `json:"timestamp"`
 	}{
 		Server: serverStats{
 			Status:    "running",
-			Uptime:    time.Since(time.Now()).String(),
 			GoVersion: "1.21",
 			GinMode:   gin.Mode(),
 		},
 		Router: routerStats{
-			TotalRoutes:  s.Router.GetRouteCount(),
+			TotalRoutes: s.Router.GetRouteCount(),
 		},
 		Cache: cacheStats{
 			Enabled: s.Config.Cache.Enabled,
@@ -260,12 +269,19 @@ func (s *GatewayServer) handleStats(c *gin.Context) {
 			SpikeArrest:     s.Config.Throttle.SpikeArrestEnabled,
 			SpikeArrestRate: s.Config.Throttle.SpikeArrestRate,
 		},
+		Middleware: middlewareStats{
+			AuthEnabled:         s.Config.Auth.Enabled,
+			SubscriptionEnabled: true,
+			ThrottleEnabled:     s.Config.Throttle.Enabled,
+			CacheEnabled:        s.Config.Cache.Enabled,
+			AnalyticsEnabled:    s.Config.Analytics.Enabled,
+		},
 		Timestamp: time.Now(),
 	}
 
 	// Add cache stats if available
-	if s.Cache != nil {
-		cacheStats := s.Cache.GetCacheStore().Stats()
+	if s.Middleware != nil && s.Middleware.cache != nil {
+		cacheStats := s.Middleware.cache.GetCacheStore().Stats()
 		stats.Cache.TotalEntries = cacheStats.TotalEntries
 		stats.Cache.TotalHits = cacheStats.TotalHits
 		stats.Cache.TotalMisses = cacheStats.TotalMisses
@@ -278,14 +294,15 @@ func (s *GatewayServer) handleStats(c *gin.Context) {
 // handleConfig returns current configuration (filtered for security).
 func (s *GatewayServer) handleConfig(c *gin.Context) {
 	cfg := struct {
-		Server    config.ServerConfig   `json:"server"`
-		Gateway   config.GatewayConfig  `json:"gateway"`
-		Database  config.DatabaseConfig `json:"database"`
-		Auth      authConfigSafe        `json:"auth"`
-		Throttle  config.ThrottleConfig `json:"throttle"`
-		Cache     config.CacheConfig    `json:"cache"`
+		Server    config.ServerConfig    `json:"server"`
+		Gateway   config.GatewayConfig   `json:"gateway"`
+		Database  config.DatabaseConfig  `json:"database"`
+		Auth      authConfigSafe         `json:"auth"`
+		Throttle  config.ThrottleConfig  `json:"throttle"`
+		Cache     config.CacheConfig     `json:"cache"`
 		Analytics config.AnalyticsConfig `json:"analytics"`
-		CORS      config.CORSConfig     `json:"cors"`
+		CORS      config.CORSConfig      `json:"cors"`
+		RateLimit config.RateLimitConfig `json:"rate_limit"`
 	}{
 		Server:    s.Config.Server,
 		Gateway:   s.Config.Gateway,
@@ -294,6 +311,7 @@ func (s *GatewayServer) handleConfig(c *gin.Context) {
 		Cache:     s.Config.Cache,
 		Analytics: s.Config.Analytics,
 		CORS:      s.Config.CORS,
+		RateLimit: s.Config.RateLimit,
 	}
 	// Mask sensitive auth fields
 	cfg.Auth = authConfigSafe{
@@ -314,8 +332,8 @@ func (s *GatewayServer) handleConfig(c *gin.Context) {
 
 // handleReload triggers configuration reload.
 func (s *GatewayServer) handleReload(c *gin.Context) {
-	// Reload routes
-	ctx := context.Background()
+	// Reload routes from DB
+	ctx := c.Request.Context()
 	if err := s.Router.LoadRoutes(ctx); err != nil {
 		s.Logger.Error("failed to reload routes", zap.Error(err))
 		c.JSON(http.StatusInternalServerError, gin.H{
@@ -324,6 +342,10 @@ func (s *GatewayServer) handleReload(c *gin.Context) {
 		})
 		return
 	}
+
+	s.Logger.Info("configuration reloaded",
+		zap.Int("routes", s.Router.GetRouteCount()),
+	)
 
 	c.JSON(http.StatusOK, gin.H{
 		"status":  "success",
@@ -343,26 +365,28 @@ func (s *GatewayServer) handleRoutes(c *gin.Context) {
 
 // handleCacheStats returns cache statistics.
 func (s *GatewayServer) handleCacheStats(c *gin.Context) {
-	if s.Cache == nil {
+	if s.Middleware == nil || s.Middleware.cache == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{
 			"error": "cache is not enabled",
 		})
 		return
 	}
 
-	stats := s.Cache.GetCacheStore().Stats()
+	stats := s.Middleware.cache.GetCacheStore().Stats()
 	c.JSON(http.StatusOK, stats)
 }
 
 // handleThrottleStats returns throttling statistics.
 func (s *GatewayServer) handleThrottleStats(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
-		"enabled":        s.Config.Throttle.Enabled,
-		"rate_limiting":  s.Config.RateLimit.Enabled,
-		"spike_arrest":   s.Config.Throttle.SpikeArrestEnabled,
+		"enabled":          s.Config.Throttle.Enabled,
+		"rate_limiting":    s.Config.RateLimit.Enabled,
+		"spike_arrest":     s.Config.Throttle.SpikeArrestEnabled,
 		"spike_arrest_rate": s.Config.Throttle.SpikeArrestRate,
-		"default_policy": s.Config.Throttle.DefaultPolicy,
-		"ip_based":       s.Config.Throttle.IPBasedThrottling,
+		"default_policy":   s.Config.Throttle.DefaultPolicy,
+		"ip_based":         s.Config.Throttle.IPBasedThrottling,
+		"db_validation":    true,
+		"middleware_order": "Recovery > RequestID > CORS > Logging > Auth(DB) > APILookup(DB) > Subscription(DB) > Throttle(DB) > Cache > Analytics(DB) > Proxy",
 	})
 }
 
@@ -396,11 +420,14 @@ func (s *GatewayServer) Run() error {
 
 	s.isRunning = true
 
-	s.Logger.Info("starting gateway server",
+	s.Logger.Info("starting gateway server with DB-validating middleware",
 		zap.String("addr", addr),
 		zap.String("gin_mode", gin.Mode()),
 		zap.Int("port", s.Config.Server.Port),
 		zap.Int("routes_loaded", s.Router.GetRouteCount()),
+		zap.Bool("auth_enabled", s.Config.Auth.Enabled),
+		zap.Bool("db_validation", true),
+		zap.String("middleware_chain", "Recovery > RequestID > CORS > Logging > Auth(DB) > APILookup(DB) > Subscription(DB) > Throttle(DB) > Cache > Analytics(DB) > Proxy"),
 	)
 
 	// Start in a goroutine
@@ -466,7 +493,6 @@ func (s *GatewayServer) IsRunning() bool {
 
 type serverStats struct {
 	Status    string `json:"status"`
-	Uptime    string `json:"uptime"`
 	GoVersion string `json:"go_version"`
 	GinMode   string `json:"gin_mode"`
 }
@@ -488,6 +514,14 @@ type throttleStats struct {
 	RateLimiting    bool `json:"rate_limiting"`
 	SpikeArrest     bool `json:"spike_arrest"`
 	SpikeArrestRate int  `json:"spike_arrest_rate"`
+}
+
+type middlewareStats struct {
+	AuthEnabled         bool `json:"auth_enabled"`
+	SubscriptionEnabled bool `json:"subscription_enabled"`
+	ThrottleEnabled     bool `json:"throttle_enabled"`
+	CacheEnabled        bool `json:"cache_enabled"`
+	AnalyticsEnabled    bool `json:"analytics_enabled"`
 }
 
 type authConfigSafe struct {

@@ -1,7 +1,11 @@
 // Package gateway provides reverse proxy functionality for the VedaDB API Manager.
-// This file implements reverse proxying with load balancing, request/response
-// transformation, header injection, circuit breaker, retry with backoff, and
-// backend health checking.
+// This file implements reverse proxying with database-backed API resolution,
+// load balancing, request/response transformation, header injection, circuit
+// breaker, retry with backoff, backend health checking, and analytics recording.
+//
+// CRITICAL: The proxy reads the resolved API endpoint from the Gin context
+// (set by APILookupMiddleware via a REAL DB query) and forwards requests
+// to the backend with proper authentication context headers.
 package gateway
 
 import (
@@ -21,8 +25,10 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
-	"github.com/tiennesdm/vedadb-apim/pkg/models"
 	"go.uber.org/zap"
+
+	"github.com/tiennesdm/vedadb-apim/pkg/models"
+	"github.com/tiennesdm/vedadb-apim/pkg/store"
 )
 
 // ---------------------------------------------------------------------------
@@ -70,11 +76,11 @@ func (b *Backend) SetHealthy(healthy bool) {
 
 // Upstream represents a group of backend servers for an API.
 type Upstream struct {
-	APIID     uuid.UUID   `json:"api_id"`
+	APIID      uuid.UUID  `json:"api_id"`
 	APIContext string     `json:"api_context"`
-	Backends  []*Backend  `json:"backends"`
-	mu        sync.RWMutex
-	strategy  LoadBalanceStrategy
+	Backends   []*Backend `json:"backends"`
+	mu         sync.RWMutex
+	strategy   LoadBalanceStrategy
 }
 
 // LoadBalanceStrategy defines the interface for load balancing algorithms.
@@ -139,9 +145,9 @@ func (u *Upstream) HealthCount() int {
 
 // WeightedRoundRobin implements weighted round-robin load balancing.
 type WeightedRoundRobin struct {
-	mu       sync.Mutex
-	current  int
-	gcd      int
+	mu        sync.Mutex
+	current   int
+	gcd       int
 	maxWeight int
 }
 
@@ -326,31 +332,37 @@ func (cb *CircuitBreaker) State() CircuitState {
 }
 
 // ---------------------------------------------------------------------------
-// Reverse Proxy
+// ProxyConfig
 // ---------------------------------------------------------------------------
 
 // ProxyConfig holds proxy configuration.
 type ProxyConfig struct {
-	RequestTimeout    time.Duration
-	RetryCount        int
-	RetryBackoff      time.Duration
-	PreserveHost      bool
-	MaxRequestBodySize int64
+	RequestTimeout      time.Duration
+	RetryCount          int
+	RetryBackoff        time.Duration
+	PreserveHost        bool
+	MaxRequestBodySize  int64
 	MaxResponseBodySize int64
 }
 
-// Proxy handles reverse proxying to backend APIs.
+// ---------------------------------------------------------------------------
+// Proxy
+// ---------------------------------------------------------------------------
+
+// Proxy handles reverse proxying to backend APIs with store integration
+// for analytics recording.
 type Proxy struct {
-	config            ProxyConfig
-	logger            *zap.Logger
-	upstreams         sync.Map // api_context -> *Upstream
-	circuitBreakers   sync.Map // api_context -> *CircuitBreaker
-	transport         *http.Transport
+	config              ProxyConfig
+	logger              *zap.Logger
+	store               store.Store
+	upstreams           sync.Map // api_context -> *Upstream
+	circuitBreakers     sync.Map // api_context -> *CircuitBreaker
+	transport           *http.Transport
 	healthCheckInterval time.Duration
 }
 
 // NewProxy creates a new reverse proxy.
-func NewProxy(config ProxyConfig, logger *zap.Logger) *Proxy {
+func NewProxy(config ProxyConfig, logger *zap.Logger, store store.Store) *Proxy {
 	if config.RequestTimeout <= 0 {
 		config.RequestTimeout = 30 * time.Second
 	}
@@ -378,6 +390,7 @@ func NewProxy(config ProxyConfig, logger *zap.Logger) *Proxy {
 	proxy := &Proxy{
 		config:              config,
 		logger:              logger,
+		store:               store,
 		transport:           transport,
 		healthCheckInterval: 30 * time.Second,
 	}
@@ -417,30 +430,47 @@ func (p *Proxy) GetCircuitBreaker(apiContext string) (*CircuitBreaker, bool) {
 }
 
 // Handler returns the Gin handler function for proxying.
+//
+// The handler reads the resolved API endpoint from the Gin context
+// (set by APILookupMiddleware via a REAL DB query to ListPublishedAPIs)
+// and forwards the request to the backend.
 func (p *Proxy) Handler() gin.HandlerFunc {
 	return func(c *gin.Context) {
-		apiContext := c.GetString("api_context")
+		// Skip admin/internal paths
+		path := c.Request.URL.Path
+		if strings.HasPrefix(path, "/health") ||
+			strings.HasPrefix(path, "/metrics") ||
+			strings.HasPrefix(path, "/admin") {
+			c.Next()
+			return
+		}
+
+		apiContext := c.GetString("apiContext")
 		if apiContext == "" {
-			c.JSON(http.StatusBadRequest, gin.H{
-				"error": "no API context found",
+			c.JSON(http.StatusNotFound, gin.H{
+				"error":   "api_not_found",
+				"message": "No published API matches the request path. Ensure the API is published and the context path is correct.",
 			})
 			return
 		}
 
-		endpoint := c.GetString("backend_endpoint")
+		// Try to get endpoint from context (set by APILookupMiddleware from DB)
+		endpoint := c.GetString("apiEndpoint")
 		if endpoint == "" {
-			// Try to get from upstream
+			// Fallback: try to get from upstream
 			upstream, ok := p.GetUpstream(apiContext)
 			if !ok || upstream == nil {
 				c.JSON(http.StatusNotFound, gin.H{
-					"error": "no backend endpoint configured for API: " + apiContext,
+					"error":   "no_backend_endpoint",
+					"message": "No backend endpoint configured for API: " + apiContext,
 				})
 				return
 			}
 			backend := upstream.Select()
 			if backend == nil {
 				c.JSON(http.StatusServiceUnavailable, gin.H{
-					"error": "no healthy backends available for API: " + apiContext,
+					"error":   "no_healthy_backends",
+					"message": "No healthy backends available for API: " + apiContext,
 				})
 				return
 			}
@@ -464,35 +494,46 @@ func (p *Proxy) Handler() gin.HandlerFunc {
 		for attempt := 0; attempt <= p.config.RetryCount; attempt++ {
 			if attempt > 0 {
 				time.Sleep(p.config.RetryBackoff * time.Duration(attempt))
-				p.logger.Info("retrying request",
+				p.logger.Info("retrying proxy request",
 					zap.String("api", apiContext),
-					zap.String("path", c.Request.URL.Path),
+					zap.String("path", path),
 					zap.Int("attempt", attempt),
+					zap.String("request_id", c.GetString("requestID")),
 				)
 			}
 
 			if err := p.proxyRequest(c, endpoint); err != nil {
 				lastErr = err
+				p.logger.Warn("proxy request failed",
+					zap.Error(err),
+					zap.String("api", apiContext),
+					zap.Int("attempt", attempt),
+					zap.String("request_id", c.GetString("requestID")),
+				)
 				continue
 			}
 
-			// Success
+			// Success - record circuit breaker success
 			if cb, ok := p.GetCircuitBreaker(apiContext); ok {
 				cb.RecordSuccess()
 			}
 			return
 		}
 
-		// All retries failed
+		// All retries failed - record circuit breaker failure
 		if cb, ok := p.GetCircuitBreaker(apiContext); ok {
 			cb.RecordFailure()
 		}
 
-		p.logger.Error("proxy request failed after retries",
+		p.logger.Error("proxy request failed after all retries",
 			zap.String("api", apiContext),
-			zap.String("path", c.Request.URL.Path),
+			zap.String("path", path),
 			zap.Error(lastErr),
+			zap.String("request_id", c.GetString("requestID")),
 		)
+
+		// Record error analytics to store
+		p.recordProxyError(c, apiContext, lastErr)
 
 		c.JSON(http.StatusBadGateway, gin.H{
 			"error":   "failed to proxy request",
@@ -503,28 +544,25 @@ func (p *Proxy) Handler() gin.HandlerFunc {
 }
 
 // proxyRequest proxies a single request to the backend.
+//
+// It reads the API endpoint from context (set by APILookupMiddleware),
+// forwards the request with injected auth context headers, and returns
+// the backend response to the client.
 func (p *Proxy) proxyRequest(c *gin.Context, endpoint string) error {
 	targetURL, err := url.Parse(endpoint)
 	if err != nil {
-		return fmt.Errorf("invalid endpoint URL: %w", err)
+		return fmt.Errorf("invalid endpoint URL %q: %w", endpoint, err)
 	}
 
-	// Build target path
-	apiContext := c.GetString("api_context")
-	resourcePath := c.GetString("resource_path")
+	// Build target path by mapping incoming path to backend path
+	apiContext := c.GetString("apiContext")
 	originalPath := c.Request.URL.Path
 
-	// Map incoming path to backend path
+	// Remove API context from path to get the backend resource path
 	backendPath := originalPath
 	if apiContext != "" && strings.HasPrefix(originalPath, apiContext) {
-		// Remove API context from path
 		backendPath = strings.TrimPrefix(originalPath, apiContext)
-		if resourcePath != "" && resourcePath != "/*" {
-			// Map resource path to backend
-			backendPath = mapPath(originalPath, apiContext+resourcePath, targetURL.Path)
-		}
 	}
-
 	if backendPath == "" {
 		backendPath = "/"
 	}
@@ -532,33 +570,76 @@ func (p *Proxy) proxyRequest(c *gin.Context, endpoint string) error {
 	targetURL.Path = singleJoiningSlash(targetURL.Path, backendPath)
 	targetURL.RawQuery = c.Request.URL.RawQuery
 
-	// Create proxy request
-	body, err := io.ReadAll(c.Request.Body)
-	if err != nil {
-		return fmt.Errorf("read request body: %w", err)
+	// Read request body
+	var body []byte
+	if c.Request.Body != nil {
+		body, err = io.ReadAll(c.Request.Body)
+		if err != nil {
+			return fmt.Errorf("read request body: %w", err)
+		}
+		c.Request.Body.Close()
 	}
-	c.Request.Body.Close()
 
-	req, err := http.NewRequestWithContext(c.Request.Context(), c.Request.Method, targetURL.String(), bytes.NewReader(body))
+	// Create proxy request with context for cancellation
+	req, err := http.NewRequestWithContext(
+		c.Request.Context(),
+		c.Request.Method,
+		targetURL.String(),
+		bytes.NewReader(body),
+	)
 	if err != nil {
 		return fmt.Errorf("create proxy request: %w", err)
 	}
 
-	// Copy headers
+	// Copy all original headers
 	for name, values := range c.Request.Header {
 		for _, value := range values {
 			req.Header.Add(name, value)
 		}
 	}
 
-	// Inject gateway headers
-	InjectHeaders(c, c.GetString("api_id"), c.GetString("app_id"), c.GetString("user_id"))
+	// Inject gateway context headers from authenticated session
+	// These are set by AuthMiddleware after DB validation
+	apiID := c.GetString("apiID")
+	appID := c.GetString("appID")
+	userID := c.GetString("userID")
+	authType := c.GetString("authType")
+	clientID := c.GetString("clientID")
+	requestID := c.GetString("requestID")
 
+	if requestID != "" {
+		req.Header.Set("X-Request-ID", requestID)
+	}
+	if apiID != "" {
+		req.Header.Set("X-API-ID", apiID)
+	}
+	if appID != "" {
+		req.Header.Set("X-Application-ID", appID)
+	}
+	if userID != "" {
+		req.Header.Set("X-User-ID", userID)
+		req.Header.Set("X-User-Context", userID)
+	}
+	if authType != "" {
+		req.Header.Set("X-Auth-Type", authType)
+	}
+	if clientID != "" {
+		req.Header.Set("X-Client-ID", clientID)
+	}
+	req.Header.Set("X-Gateway-Name", "VedaDB-APIM")
+	req.Header.Set("X-API-Context", apiContext)
+
+	// Remove hop-by-hop headers
+	for _, h := range hopByHopHeaders {
+		req.Header.Del(h)
+	}
+
+	// Set/override Host header
 	if !p.config.PreserveHost {
 		req.Host = targetURL.Host
 	}
 
-	// Execute request
+	// Execute proxy request
 	client := &http.Client{
 		Transport: p.transport,
 		Timeout:   p.config.RequestTimeout,
@@ -567,31 +648,143 @@ func (p *Proxy) proxyRequest(c *gin.Context, endpoint string) error {
 		},
 	}
 
+	start := time.Now()
 	resp, err := client.Do(req)
+	latency := time.Since(start)
+
 	if err != nil {
-		return fmt.Errorf("execute proxy request: %w", err)
+		// Record error analytics to store (best-effort, non-blocking)
+		p.recordProxyError(c, apiContext, err)
+		return fmt.Errorf("execute proxy request to %s: %w", targetURL.String(), err)
 	}
 	defer resp.Body.Close()
 
-	// Copy response headers
+	// Copy response headers (excluding gateway-internal ones)
 	for name, values := range resp.Header {
 		for _, value := range values {
 			c.Header(name, value)
 		}
 	}
 
-	// Set gateway headers
+	// Set gateway response headers
 	c.Header("X-Gateway-Version", "1.0.0")
+	c.Header("X-Proxied-By", "VedaDB-APIM-Gateway")
+	c.Header("X-Proxy-Latency", fmt.Sprintf("%dms", latency.Milliseconds()))
 
-	// Copy response body
+	// Strip gateway-internal headers from backend response
+	StripGatewayHeaders(c.Writer.Header())
+
+	// Read response body
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return fmt.Errorf("read response body: %w", err)
 	}
 
+	// Write response to client
 	c.Data(resp.StatusCode, resp.Header.Get("Content-Type"), respBody)
+
+	// Record success analytics to store (best-effort, non-blocking)
+	p.recordProxySuccess(c, apiContext, appID, userID, resp.StatusCode, latency)
+
 	return nil
 }
+
+// hopByHopHeaders are headers that should not be forwarded.
+var hopByHopHeaders = []string{
+	"Connection",
+	"Proxy-Connection",
+	"Keep-Alive",
+	"Transfer-Encoding",
+	"TE",
+	"Trailer",
+	"Proxy-Authorization",
+	"Proxy-Authenticate",
+	"Upgrade",
+}
+
+// recordProxySuccess records a successful proxy request to the analytics store.
+func (p *Proxy) recordProxySuccess(c *gin.Context, apiID, appID, userID string, statusCode int, latency time.Duration) {
+	if p.store == nil {
+		return
+	}
+
+	requestID := c.GetString("requestID")
+	tenantID := c.GetString("tenantID")
+
+	event := &models.AnalyticsEventDB{
+		ID:         uuid.New().String(),
+		TenantID:   tenantID,
+		RequestID:  requestID,
+		APIID:      apiID,
+		AppID:      appID,
+		UserID:     userID,
+		Method:     c.Request.Method,
+		Path:       c.Request.URL.Path,
+		StatusCode: statusCode,
+		LatencyMs:  int(latency.Milliseconds()),
+		UserAgent:  c.Request.UserAgent(),
+		ClientIP:   c.ClientIP(),
+		Timestamp:  time.Now(),
+	}
+
+	// Fire-and-forget: don't block response on analytics
+	go func(ev *models.AnalyticsEventDB) {
+		if err := p.store.InsertAnalyticsEvent(ev); err != nil {
+			p.logger.Warn("failed to store proxy success analytics",
+				zap.Error(err),
+				zap.String("request_id", requestID),
+			)
+		}
+	}(event)
+}
+
+// recordProxyError records a failed proxy request to the analytics store.
+func (p *Proxy) recordProxyError(c *gin.Context, apiID string, proxyErr error) {
+	if p.store == nil {
+		return
+	}
+
+	requestID := c.GetString("requestID")
+	tenantID := c.GetString("tenantID")
+	appID := c.GetString("appID")
+	userID := c.GetString("userID")
+
+	errMsg := ""
+	if proxyErr != nil {
+		errMsg = proxyErr.Error()
+	}
+
+	event := &models.AnalyticsEventDB{
+		ID:           uuid.New().String(),
+		TenantID:     tenantID,
+		RequestID:    requestID,
+		APIID:        apiID,
+		AppID:        appID,
+		UserID:       userID,
+		Method:       c.Request.Method,
+		Path:         c.Request.URL.Path,
+		StatusCode:   http.StatusBadGateway,
+		LatencyMs:    0,
+		ErrorMessage: errMsg,
+		UserAgent:    c.Request.UserAgent(),
+		ClientIP:     c.ClientIP(),
+		Timestamp:    time.Now(),
+	}
+
+	// Fire-and-forget
+	go func(ev *models.AnalyticsEventDB) {
+		if err := p.store.InsertAnalyticsEvent(ev); err != nil {
+			p.logger.Warn("failed to store proxy error analytics",
+				zap.Error(err),
+				zap.String("request_id", requestID),
+			)
+		}
+	}(event)
+}
+
+// ---------------------------------------------------------------------------
+// Path Utilities
+// ---------------------------------------------------------------------------
 
 // mapPath maps the incoming request path to the backend path.
 func mapPath(requestPath, routePattern, backendPrefix string) string {
@@ -655,7 +848,6 @@ func (p *Proxy) checkBackendHealth(backend *Backend) {
 		},
 	}
 
-	// Try GET on root path, fallback to HEAD
 	healthURL := backend.URL
 	resp, err := client.Head(healthURL)
 	if err != nil {
@@ -680,6 +872,10 @@ func (p *Proxy) checkBackendHealth(backend *Backend) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// Reverse Proxy Handler Utility
+// ---------------------------------------------------------------------------
+
 // ReverseProxyHandler creates a standard reverse proxy handler.
 func ReverseProxyHandler(target string) (gin.HandlerFunc, error) {
 	targetURL, err := url.Parse(target)
@@ -698,4 +894,48 @@ func ReverseProxyHandler(target string) (gin.HandlerFunc, error) {
 	return func(c *gin.Context) {
 		proxy.ServeHTTP(c.Writer, c.Request)
 	}, nil
+}
+
+// ---------------------------------------------------------------------------
+// Proxy Analytics Store Recording (blocking variant for middleware use)
+// ---------------------------------------------------------------------------
+
+// RecordAnalytics records a request to the analytics store.
+// This variant is used directly by middleware for synchronous recording.
+func (p *Proxy) RecordAnalytics(c *gin.Context, statusCode int, latency time.Duration, errMsg string) {
+	if p.store == nil {
+		return
+	}
+
+	requestID := c.GetString("requestID")
+	apiID := c.GetString("apiID")
+	appID := c.GetString("appID")
+	userID := c.GetString("userID")
+	tenantID := c.GetString("tenantID")
+
+	event := &models.AnalyticsEventDB{
+		ID:           uuid.New().String(),
+		TenantID:     tenantID,
+		RequestID:    requestID,
+		APIID:        apiID,
+		AppID:        appID,
+		UserID:       userID,
+		Method:       c.Request.Method,
+		Path:         c.Request.URL.Path,
+		StatusCode:   statusCode,
+		LatencyMs:    int(latency.Milliseconds()),
+		ErrorMessage: errMsg,
+		UserAgent:    c.Request.UserAgent(),
+		ClientIP:     c.ClientIP(),
+		Timestamp:    time.Now(),
+	}
+
+	go func(ev *models.AnalyticsEventDB) {
+		if err := p.store.InsertAnalyticsEvent(ev); err != nil {
+			p.logger.Warn("failed to store analytics",
+				zap.Error(err),
+				zap.String("request_id", requestID),
+			)
+		}
+	}(event)
 }

@@ -1,421 +1,173 @@
-// Package audit provides a comprehensive audit logging system for the VedaDB API Manager.
-// It logs all admin actions, API lifecycle changes, subscription changes, and authentication events.
+// Package audit provides buffered audit logging with guaranteed database persistence.
+// Every audit entry is written to the audit_log table via a background worker
+// that drains a buffered channel. Entries are never silently dropped.
 package audit
 
 import (
 	"context"
-	"database/sql"
 	"encoding/json"
-	"fmt"
-	"log/slog"
-	"os"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/vedadb/vapim/internal/tenant"
+	"go.uber.org/zap"
+
 	"github.com/vedadb/vapim/pkg/models"
+	"github.com/vedadb/vapim/pkg/store"
 )
 
-const (
-	// TableName is the database table for audit logs.
-	TableName = "audit_log"
-
-	// ActionAPICreate is logged when an API is created.
-	ActionAPICreate = "API_CREATE"
-	// ActionAPIUpdate is logged when an API is updated.
-	ActionAPIUpdate = "API_UPDATE"
-	// ActionAPIDelete is logged when an API is deleted.
-	ActionAPIDelete = "API_DELETE"
-	// ActionAPIPublish is logged when an API is published.
-	ActionAPIPublish = "API_PUBLISH"
-	// ActionAPIDeprecate is logged when an API is deprecated.
-	ActionAPIDeprecate = "API_DEPRECATE"
-	// ActionAPIRetire is logged when an API is retired.
-	ActionAPIRetire = "API_RETIRE"
-
-	// ActionSubscriptionCreate is logged when a subscription is created.
-	ActionSubscriptionCreate = "SUBSCRIPTION_CREATE"
-	// ActionSubscriptionCancel is logged when a subscription is cancelled.
-	ActionSubscriptionCancel = "SUBSCRIPTION_CANCEL"
-	// ActionSubscriptionBlock is logged when a subscription is blocked.
-	ActionSubscriptionBlock = "SUBSCRIPTION_BLOCK"
-
-	// ActionAuthLogin is logged on login attempts.
-	ActionAuthLogin = "AUTH_LOGIN"
-	// ActionAuthLogout is logged on logout.
-	ActionAuthLogout = "AUTH_LOGOUT"
-	// ActionAuthTokenRefresh is logged on token refresh.
-	ActionAuthTokenRefresh = "AUTH_TOKEN_REFRESH"
-	// ActionAuthPasswordChange is logged on password change.
-	ActionAuthPasswordChange = "AUTH_PASSWORD_CHANGE"
-
-	// ActionAdminCreate is logged for admin creation operations.
-	ActionAdminCreate = "ADMIN_CREATE"
-	// ActionAdminUpdate is logged for admin update operations.
-	ActionAdminUpdate = "ADMIN_UPDATE"
-	// ActionAdminDelete is logged for admin delete operations.
-	ActionAdminDelete = "ADMIN_DELETE"
-	// ActionAdminConfigChange is logged for configuration changes.
-	ActionAdminConfigChange = "ADMIN_CONFIG_CHANGE"
-
-	// ActionWebhookCreate is logged when a webhook is registered.
-	ActionWebhookCreate = "WEBHOOK_CREATE"
-	// ActionWebhookDelete is logged when a webhook is unregistered.
-	ActionWebhookDelete = "WEBHOOK_DELETE"
-
-	// ActionPolicyCreate is logged when a throttle policy is created.
-	ActionPolicyCreate = "POLICY_CREATE"
-	// ActionPolicyUpdate is logged when a throttle policy is updated.
-	ActionPolicyUpdate = "POLICY_UPDATE"
-	// ActionPolicyDelete is logged when a throttle policy is deleted.
-	ActionPolicyDelete = "POLICY_DELETE"
-)
-
-// SQLStore defines the interface for database operations used by the audit logger.
-type SQLStore interface {
-	QueryContext(ctx context.Context, query string, args ...interface{}) (*sql.Rows, error)
-	QueryRowContext(ctx context.Context, query string, args ...interface{}) *sql.Row
-	ExecContext(ctx context.Context, query string, args ...interface{}) (sql.Result, error)
+// AuditLogger buffers audit entries and persists them to the database via a
+// background worker. It guarantees that entries are either written to the DB
+// or logged as errors on failure.
+type AuditLogger struct {
+	store  store.Store
+	buffer chan *models.AuditLogDB
+	logger *zap.Logger
+	wg     sync.WaitGroup
+	done   chan struct{}
 }
 
-// LoggerOpts configures the audit logger behavior.
-type LoggerOpts struct {
-	// Store is the SQL database handle.
-	Store SQLStore
-	// StdoutEnabled writes audit entries to stdout.
-	StdoutEnabled bool
-	// Async enables asynchronous (non-blocking) logging via goroutines.
-	Async bool
-	// MaxAsyncQueueSize limits the number of pending async log entries.
-	MaxAsyncQueueSize int
+// NewAuditLogger creates an AuditLogger backed by the given store. A background
+// worker is started immediately to process entries from the buffer.
+func NewAuditLogger(st store.Store, logger *zap.Logger) *AuditLogger {
+	if logger == nil {
+		logger = zap.NewNop()
+	}
+	al := &AuditLogger{
+		store:  st,
+		buffer: make(chan *models.AuditLogDB, 1000),
+		logger: logger,
+		done:   make(chan struct{}),
+	}
+	go al.worker()
+	return al
 }
 
-// AuditLogger defines the interface for audit logging operations.
-type AuditLogger interface {
-	// Log records a generic audit event.
-	Log(ctx context.Context, action, resourceType, resourceID string, details map[string]interface{})
-	// LogAPIAction records an API lifecycle action.
-	LogAPIAction(ctx context.Context, action string, api *models.API)
-	// LogSubscriptionAction records a subscription action.
-	LogSubscriptionAction(ctx context.Context, action string, sub *models.Subscription)
-	// LogAuthEvent records an authentication event.
-	LogAuthEvent(ctx context.Context, action, userID string, success bool, details string)
-	// LogAdminAction records an administrative action.
-	LogAdminAction(ctx context.Context, action string, details map[string]interface{})
-	// GetLogs retrieves audit logs with pagination.
-	GetLogs(ctx context.Context, tenantID string, limit, offset int) ([]*models.AuditLog, int, error)
-}
-
-// Ensure DefaultLogger implements AuditLogger.
-var _ AuditLogger = (*DefaultLogger)(nil)
-
-// DefaultLogger is the production implementation of AuditLogger.
-type DefaultLogger struct {
-	store           SQLStore
-	slogger         *slog.Logger
-	stdoutEnabled   bool
-	async           bool
-	asyncQueue      chan *logEntry
-	asyncDone       chan struct{}
-}
-
-// logEntry is an internal structure for queued log entries.
-type logEntry struct {
-	ctx          context.Context
-	action       string
-	resourceType string
-	resourceID   string
-	userID       *string
-	username     *string
-	ipAddress    *string
-	details      map[string]interface{}
-}
-
-// NewLogger creates a new audit logger.
-func NewLogger(opts LoggerOpts) (*DefaultLogger, error) {
-	slogger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
-		Level: slog.LevelInfo,
-	}))
-
-	l := &DefaultLogger{
-		store:         opts.Store,
-		slogger:       slogger,
-		stdoutEnabled: opts.StdoutEnabled,
-		async:         opts.Async,
-	}
-
-	if opts.Async {
-		queueSize := opts.MaxAsyncQueueSize
-		if queueSize <= 0 {
-			queueSize = 1000
-		}
-		l.asyncQueue = make(chan *logEntry, queueSize)
-		l.asyncDone = make(chan struct{})
-		go l.asyncWorker()
-	}
-
-	return l, nil
-}
-
-// Close gracefully shuts down the async worker.
-func (l *DefaultLogger) Close() error {
-	if l.async && l.asyncDone != nil {
-		close(l.asyncQueue)
-		<-l.asyncDone
-	}
-	return nil
-}
-
-// asyncWorker processes queued log entries in the background.
-func (l *DefaultLogger) asyncWorker() {
-	defer close(l.asyncDone)
-	for entry := range l.asyncQueue {
-		if entry == nil {
-			continue
-		}
-		l.writeSync(entry.ctx, entry.action, entry.resourceType, entry.resourceID,
-			entry.userID, entry.username, entry.ipAddress, entry.details)
-	}
-}
-
-// Log records a generic audit event.
-func (l *DefaultLogger) Log(ctx context.Context, action, resourceType, resourceID string, details map[string]interface{}) {
-	userID, username := extractUserFromContext(ctx)
-	ipAddress := extractIPFromContext(ctx)
-
-	entry := &logEntry{
-		ctx:          ctx,
-		action:       action,
-		resourceType: resourceType,
-		resourceID:   resourceID,
-		userID:       userID,
-		username:     username,
-		ipAddress:    ipAddress,
-		details:      details,
-	}
-
-	if l.async {
-		select {
-		case l.asyncQueue <- entry:
-			// queued successfully
-		default:
-			// queue full, fall back to sync logging
-			l.writeSync(ctx, action, resourceType, resourceID, userID, username, ipAddress, details)
-		}
-	} else {
-		l.writeSync(ctx, action, resourceType, resourceID, userID, username, ipAddress, details)
-	}
-}
-
-// LogAPIAction records an API lifecycle action.
-func (l *DefaultLogger) LogAPIAction(ctx context.Context, action string, api *models.API) {
-	details := map[string]interface{}{
-		"api_name":    api.Name,
-		"api_version": api.Version,
-		"api_context": api.Context,
-		"auth_type":   api.AuthType,
-		"status":      api.Status,
-		"endpoint":    api.Endpoint,
-	}
-	if api.Provider != nil {
-		details["provider"] = *api.Provider
-	}
-	l.Log(ctx, action, "API", api.ID, details)
-}
-
-// LogSubscriptionAction records a subscription action.
-func (l *DefaultLogger) LogSubscriptionAction(ctx context.Context, action string, sub *models.Subscription) {
-	details := map[string]interface{}{
-		"api_id":         sub.APIID,
-		"application_id": sub.ApplicationID,
-		"tier":           sub.Tier,
-		"status":         sub.Status,
-	}
-	if sub.API != nil {
-		details["api_name"] = sub.API.Name
-	}
-	if sub.Application != nil {
-		details["app_name"] = sub.Application.Name
-	}
-	l.Log(ctx, action, "SUBSCRIPTION", sub.ID, details)
-}
-
-// LogAuthEvent records an authentication event.
-func (l *DefaultLogger) LogAuthEvent(ctx context.Context, action, userID string, success bool, details string) {
-	d := map[string]interface{}{
-		"success": success,
-	}
-	if details != "" {
-		d["details"] = details
-	}
-
-	var userIDPtr *string
-	if userID != "" {
-		userIDPtr = &userID
-	}
-
-	username, _ := extractUserFromContext(ctx)
-	ipAddress := extractIPFromContext(ctx)
-
-	l.writeSync(ctx, action, "AUTH", userID, userIDPtr, username, ipAddress, d)
-}
-
-// LogAdminAction records an administrative action.
-func (l *DefaultLogger) LogAdminAction(ctx context.Context, action string, details map[string]interface{}) {
-	// Ensure details is not nil
-	if details == nil {
-		details = map[string]interface{}{}
-	}
-
-	// Add admin role context
-	if role, ok := ctx.Value("user_role").(string); ok {
-		details["actor_role"] = role
-	}
-
-	l.Log(ctx, action, "ADMIN", "", details)
-}
-
-// GetLogs retrieves audit logs filtered by tenant with pagination.
-func (l *DefaultLogger) GetLogs(ctx context.Context, tenantID string, limit, offset int) ([]*models.AuditLog, int, error) {
-	if limit <= 0 || limit > 1000 {
-		limit = 100
-	}
-	if offset < 0 {
-		offset = 0
-	}
-
-	// Count total
-	var total int
-	countQuery := `SELECT COUNT(*) FROM ` + TableName + ` WHERE tenant_id = $1`
-	row := l.store.QueryRowContext(ctx, countQuery, tenantID)
-	if err := row.Scan(&total); err != nil {
-		return nil, 0, fmt.Errorf("count audit logs: %w", err)
-	}
-
-	// Fetch paginated results
-	query := `
-		SELECT id, action, resource_type, resource_id, user_id, username, ip_address, details, tenant_id, created_at
-		FROM ` + TableName + `
-		WHERE tenant_id = $1
-		ORDER BY created_at DESC
-		LIMIT $2 OFFSET $3
-	`
-
-	rows, err := l.store.QueryContext(ctx, query, tenantID, limit, offset)
-	if err != nil {
-		return nil, 0, fmt.Errorf("query audit logs: %w", err)
-	}
-	defer rows.Close()
-
-	var logs []*models.AuditLog
-	for rows.Next() {
-		entry := &models.AuditLog{}
-		var detailsBytes []byte
-		err := rows.Scan(
-			&entry.ID, &entry.Action, &entry.ResourceType, &entry.ResourceID,
-			&entry.UserID, &entry.Username, &entry.IPAddress,
-			&detailsBytes, &entry.TenantID, &entry.CreatedAt,
-		)
-		if err != nil {
-			return nil, 0, fmt.Errorf("scan audit log: %w", err)
-		}
-		if len(detailsBytes) > 0 {
-			_ = json.Unmarshal(detailsBytes, &entry.Details)
-		}
-		logs = append(logs, entry)
-	}
-
-	if err := rows.Err(); err != nil {
-		return nil, 0, fmt.Errorf("iterate audit logs: %w", err)
-	}
-
-	return logs, total, nil
-}
-
-// writeSync performs the actual synchronous write to database and optionally stdout.
-func (l *DefaultLogger) writeSync(ctx context.Context, action, resourceType, resourceID string,
-	userID, username, ipAddress *string, details map[string]interface{}) {
-
-	tenantID := tenant.TenantIDFromContext(ctx)
+// Log creates an audit entry and queues it for DB persistence. The call is
+// non-blocking; if the buffer is full the entry is dropped and a warning is
+// logged. Context values "tenantID" and "userID" are extracted if present.
+func (al *AuditLogger) Log(ctx context.Context, action, resourceType, resourceID string, details map[string]interface{}) {
+	tenantID, _ := ctx.Value("tenantID").(string)
 	if tenantID == "" {
-		tenantID = "system"
+		tenantID, _ = ctx.Value("tenant_id").(string)
 	}
 
-	id := uuid.New().String()
-	now := time.Now().UTC()
-
-	var detailsJSON []byte
-	if details != nil {
-		detailsJSON, _ = json.Marshal(details)
+	userID, _ := ctx.Value("userID").(string)
+	if userID == "" {
+		userID, _ = ctx.Value("user_id").(string)
 	}
 
-	// Write to database
-	query := `
-		INSERT INTO ` + TableName + `
-		(id, action, resource_type, resource_id, user_id, username, ip_address, details, tenant_id, created_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-	`
-	_, err := l.store.ExecContext(ctx, query, id, action, resourceType, resourceID,
-		userID, username, ipAddress, detailsJSON, tenantID, now)
+	// Extract IP and user agent from context if available.
+	ip, _ := ctx.Value("client_ip").(string)
+	ua, _ := ctx.Value("user_agent").(string)
+
+	detailsJSON, err := json.Marshal(details)
 	if err != nil {
-		l.slogger.ErrorContext(ctx, "audit log db write failed",
-			slog.String("error", err.Error()),
-			slog.String("action", action),
-		)
+		detailsJSON = []byte("{}")
 	}
 
-	// Write to stdout
-	if l.stdoutEnabled {
-		l.slogger.InfoContext(ctx, "AUDIT",
-			slog.String("id", id),
-			slog.String("tenant", tenantID),
-			slog.String("action", action),
-			slog.String("resource_type", resourceType),
-			slog.String("resource_id", resourceID),
-			slog.Time("timestamp", now),
+	entry := &models.AuditLogDB{
+		ID:           uuid.New().String(),
+		TenantID:     tenantID,
+		UserID:       userID,
+		Action:       action,
+		ResourceType: resourceType,
+		ResourceID:   resourceID,
+		Details:      string(detailsJSON),
+		IPAddress:    ip,
+		UserAgent:    ua,
+		Timestamp:    time.Now(),
+	}
+
+	select {
+	case al.buffer <- entry:
+		// queued successfully
+	default:
+		al.logger.Warn("audit buffer full, dropping entry",
+			zap.String("action", action),
+			zap.String("resource_type", resourceType),
 		)
 	}
 }
 
-// extractUserFromContext attempts to extract user information from the context.
-func extractUserFromContext(ctx context.Context) (*string, *string) {
-	if userID, ok := ctx.Value("user_id").(string); ok && userID != "" {
-		var username *string
-		if un, ok := ctx.Value("username").(string); ok {
-			username = &un
+// worker is the background goroutine that drains the buffer and writes
+// entries to the database one at a time.
+func (al *AuditLogger) worker() {
+	al.wg.Add(1)
+	defer al.wg.Done()
+
+	for {
+		select {
+		case entry := <-al.buffer:
+			if err := al.store.InsertAuditLog(entry); err != nil {
+				al.logger.Error("failed to write audit log to DB",
+					zap.Error(err),
+					zap.String("action", entry.Action),
+					zap.String("resource_id", entry.ResourceID),
+				)
+			}
+		case <-al.done:
+			// Drain remaining entries before shutdown.
+			for {
+				select {
+				case entry := <-al.buffer:
+					if err := al.store.InsertAuditLog(entry); err != nil {
+						al.logger.Error("failed to write audit log on shutdown",
+							zap.Error(err),
+							zap.String("action", entry.Action),
+						)
+					}
+				default:
+					return
+				}
+			}
 		}
-		return &userID, username
 	}
-	return nil, nil
 }
 
-// extractIPFromContext attempts to extract the client IP from the context.
-func extractIPFromContext(ctx context.Context) *string {
-	if ip, ok := ctx.Value("client_ip").(string); ok && ip != "" {
-		return &ip
-	}
-	return nil
+// LogAPIAction logs an audit entry for an API lifecycle event (create, update,
+// delete, publish, etc.).
+func (al *AuditLogger) LogAPIAction(ctx context.Context, action string, api *models.API) {
+	al.Log(ctx, action, "api", api.ID, map[string]interface{}{
+		"api_name":    api.Name,
+		"api_context": api.Context,
+		"api_version": api.Version,
+		"status":      api.Status,
+	})
 }
 
-// NopLogger is a no-op implementation of AuditLogger for testing.
-type NopLogger struct{}
+// LogSubscriptionAction logs an audit entry for a subscription lifecycle event.
+func (al *AuditLogger) LogSubscriptionAction(ctx context.Context, action string, sub *models.Subscription) {
+	al.Log(ctx, action, "subscription", sub.ID, map[string]interface{}{
+		"api_id": sub.APIID,
+		"app_id": sub.AppID,
+		"tier":   sub.Tier,
+		"status": sub.Status,
+	})
+}
 
-// Log implements AuditLogger as a no-op.
-func (n *NopLogger) Log(ctx context.Context, action, resourceType, resourceID string, details map[string]interface{}) {}
+// LogAuthEvent logs an authentication or authorization event.
+func (al *AuditLogger) LogAuthEvent(ctx context.Context, action, userID string, success bool, detail string) {
+	al.Log(ctx, action, "auth", userID, map[string]interface{}{
+		"success": success,
+		"detail":  detail,
+	})
+}
 
-// LogAPIAction implements AuditLogger as a no-op.
-func (n *NopLogger) LogAPIAction(ctx context.Context, action string, api *models.API) {}
+// LogAdminAction logs an administrative action such as configuration changes,
+// tenant management, or policy updates.
+func (al *AuditLogger) LogAdminAction(ctx context.Context, action string, details map[string]interface{}) {
+	al.Log(ctx, action, "admin", "", details)
+}
 
-// LogSubscriptionAction implements AuditLogger as a no-op.
-func (n *NopLogger) LogSubscriptionAction(ctx context.Context, action string, sub *models.Subscription) {}
+// GetLogs retrieves audit logs for a tenant with pagination.
+func (al *AuditLogger) GetLogs(tenantID string, limit, offset int) ([]*models.AuditLogDB, int, error) {
+	return al.store.GetAuditLogs(tenantID, limit, offset)
+}
 
-// LogAuthEvent implements AuditLogger as a no-op.
-func (n *NopLogger) LogAuthEvent(ctx context.Context, action, userID string, success bool, details string) {}
-
-// LogAdminAction implements AuditLogger as a no-op.
-func (n *NopLogger) LogAdminAction(ctx context.Context, action string, details map[string]interface{}) {}
-
-// GetLogs implements AuditLogger as a no-op.
-func (n *NopLogger) GetLogs(ctx context.Context, tenantID string, limit, offset int) ([]*models.AuditLog, int, error) {
-	return nil, 0, nil
+// Close signals the background worker to shut down and waits for it to finish
+// draining any queued entries.
+func (al *AuditLogger) Close() {
+	close(al.done)
+	al.wg.Wait()
 }
