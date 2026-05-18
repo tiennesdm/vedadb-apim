@@ -15,7 +15,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
-	"github.com/tiennesdm/vedadb-apim/pkg/models"
+	"github.com/vedadb/vapim/pkg/models"
 )
 
 // Route defines a single API route in the gateway.

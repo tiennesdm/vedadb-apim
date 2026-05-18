@@ -7,7 +7,7 @@ import (
 	"strings"
 
 	"github.com/gin-gonic/gin"
-	"github.com/tiennesdm/vedadb-apim/pkg/models"
+	"github.com/vedadb/vapim/pkg/models"
 )
 
 // Permission represents a named action that can be guarded.

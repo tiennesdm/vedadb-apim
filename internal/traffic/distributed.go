@@ -7,7 +7,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/tiennesdm/vedadb-apim/pkg/models"
+	"github.com/vedadb/vapim/pkg/models"
 )
 
 // DistributedRateLimiter implements cluster-aware rate limiting using

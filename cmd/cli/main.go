@@ -75,6 +75,12 @@ Complete documentation is available at https://docs.vedadata.com/apim`,
 	rootCmd.AddCommand(newConfigCmd())
 	rootCmd.AddCommand(newAnalyticsCmd())
 	rootCmd.AddCommand(newWebhookCmd())
+	rootCmd.AddCommand(newStatusCmd())
+
+	// Add alias commands (apis -> api, apps -> app, keys -> app keys)
+	rootCmd.AddCommand(newAPIsAliasCmd())
+	rootCmd.AddCommand(newAppsAliasCmd())
+	rootCmd.AddCommand(newKeysCmd())
 
 	return rootCmd
 }

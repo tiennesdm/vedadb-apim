@@ -6,7 +6,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 
-	"github.com/tiennesdm/vedadb-apim/pkg/models"
+	"github.com/vedadb/vapim/pkg/models"
 )
 
 // handleSubscribeToAPI creates a new subscription linking an application to an API.

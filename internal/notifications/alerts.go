@@ -7,7 +7,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/tiennesdm/vedadb-apim/pkg/store"
+	"github.com/vedadb/vapim/pkg/store"
 )
 
 // ---------------------------------------------------------------------------

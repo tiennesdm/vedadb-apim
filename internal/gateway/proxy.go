@@ -27,8 +27,8 @@ import (
 	"github.com/google/uuid"
 	"go.uber.org/zap"
 
-	"github.com/tiennesdm/vedadb-apim/pkg/models"
-	"github.com/tiennesdm/vedadb-apim/pkg/store"
+	"github.com/vedadb/vapim/pkg/models"
+	"github.com/vedadb/vapim/pkg/store"
 )
 
 // ---------------------------------------------------------------------------

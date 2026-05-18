@@ -8,7 +8,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/tiennesdm/vedadb-apim/pkg/models"
+	"github.com/vedadb/vapim/pkg/models"
 )
 
 // ThrottleLevel represents the level at which throttling is applied.

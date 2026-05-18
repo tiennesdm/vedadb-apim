@@ -5,6 +5,7 @@ package publisher
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"os"
@@ -14,8 +15,9 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/tiennesdm/vedadb-apim/internal/auth"
-	"github.com/tiennesdm/vedadb-apim/pkg/models"
+	"github.com/vedadb/vapim/internal/audit"
+	"github.com/vedadb/vapim/internal/auth"
+	"github.com/vedadb/vapim/pkg/models"
 )
 
 // Store defines the persistence interface required by the Publisher.
@@ -158,6 +160,9 @@ func (s *Server) setupRouter() {
 		apiRoutes.POST("/:api_id/policies/:policy_id", auth.PublisherOrAbove(), s.policy.AttachPolicy)
 		apiRoutes.DELETE("/:api_id/policies/:policy_id", auth.AdminOnly(), s.policy.DetachPolicy)
 		apiRoutes.GET("/:api_id/policies", s.policy.ListAttachedPolicies)
+
+		// Export
+		apiRoutes.GET("/:api_id/export", s.handleExportOpenAPI)
 	}
 
 	// Standalone policy management
@@ -171,6 +176,10 @@ func (s *Server) setupRouter() {
 		policyRoutes.POST("/templates", auth.AdminOnly(), s.policy.CreatePolicyFromTemplate)
 		policyRoutes.GET("/templates", s.listPolicyTemplates)
 	}
+
+	// Audit log routes
+	auditAPI := audit.NewAPI(s.store)
+	auditAPI.RegisterRoutes(r.Group(""))
 
 	s.router = r
 }
@@ -329,4 +338,143 @@ func (s *Server) listPolicyTemplates(c *gin.Context) {
 		"templates": GetPolicyTemplates(),
 		"total":     len(GetPolicyTemplates()),
 	})
+}
+
+// handleExportOpenAPI exports an API as an OpenAPI 3.0 JSON specification.
+func (s *Server) handleExportOpenAPI(c *gin.Context) {
+	apiID := c.Param("api_id")
+
+	// Fetch the API
+	api, err := s.store.GetAPI(apiID)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "API not found"})
+		return
+	}
+
+	// Fetch API resources
+	resources, err := s.store.ListResourcesByAPI(apiID)
+	if err != nil {
+		resources = []models.APIResource{}
+	}
+
+	// Build OpenAPI 3.0 spec
+	spec := buildOpenAPISpec(api, resources)
+
+	c.Header("Content-Type", "application/json")
+	c.Header("Content-Disposition", fmt.Sprintf("attachment; filename=%s-openapi.json", api.Context))
+	c.JSON(http.StatusOK, spec)
+}
+
+// buildOpenAPISpec constructs an OpenAPI 3.0 specification from an API and its resources.
+func buildOpenAPISpec(api *models.API, resources []models.APIResource) map[string]interface{} {
+	paths := make(map[string]interface{})
+	components := map[string]interface{}{
+		"securitySchemes": map[string]interface{}{},
+	}
+
+	// Security scheme based on auth type
+	switch api.AuthType {
+	case "oauth2":
+		components["securitySchemes"] = map[string]interface{}{
+			"OAuth2": map[string]interface{}{
+				"type": "oauth2",
+				"flows": map[string]interface{}{
+					"clientCredentials": map[string]interface{}{
+						"tokenUrl": fmt.Sprintf("%s/oauth2/token", api.Endpoint),
+						"scopes":   map[string]string{},
+					},
+					"authorizationCode": map[string]interface{}{
+						"authorizationUrl": fmt.Sprintf("%s/oauth2/authorize", api.Endpoint),
+						"tokenUrl":         fmt.Sprintf("%s/oauth2/token", api.Endpoint),
+						"scopes":           map[string]string{},
+					},
+				},
+			},
+		}
+	case "apikey":
+		components["securitySchemes"] = map[string]interface{}{
+			"ApiKeyAuth": map[string]interface{}{
+				"type": "apiKey",
+				"in":   "header",
+				"name": "X-API-Key",
+			},
+		}
+	case "basic":
+		components["securitySchemes"] = map[string]interface{}{
+			"BasicAuth": map[string]interface{}{
+				"type":   "http",
+				"scheme": "basic",
+			},
+		}
+	}
+
+	// Build paths from resources
+	for _, res := range resources {
+		if _, ok := paths[res.Path]; !ok {
+			paths[res.Path] = map[string]interface{}{}
+		}
+		pathItem := paths[res.Path].(map[string]interface{})
+
+		op := map[string]interface{}{
+			"operationId": fmt.Sprintf("%s_%s", strings.ToLower(res.Method), strings.ReplaceAll(res.Path, "/", "_")),
+			"description": res.Description,
+			"responses": map[string]interface{}{
+				"200": map[string]interface{}{
+					"description": "Successful response",
+				},
+				"401": map[string]interface{}{
+					"description": "Unauthorized",
+				},
+				"403": map[string]interface{}{
+					"description": "Forbidden",
+				},
+				"500": map[string]interface{}{
+					"description": "Internal server error",
+				},
+			},
+		}
+
+		if res.AuthRequired {
+			op["security"] = []map[string][]string{
+				{strings.Title(api.AuthType) + "Auth": {}},
+			}
+		}
+
+		method := strings.ToLower(res.Method)
+		switch method {
+		case "get", "post", "put", "patch", "delete", "head", "options":
+			pathItem[method] = op
+		}
+	}
+
+	spec := map[string]interface{}{
+		"openapi": "3.0.3",
+		"info": map[string]interface{}{
+			"title":       api.Name,
+			"description":  api.Description,
+			"version":     api.Version,
+			"contact": map[string]interface{}{
+				"name": api.CreatedBy,
+			},
+		},
+		"servers": []map[string]interface{}{
+			{
+				"url":         api.Endpoint,
+				"description": api.Name + " server",
+			},
+		},
+		"paths":      paths,
+		"components": components,
+	}
+
+	// Tags
+	if len(api.Tags) > 0 {
+		tags := make([]map[string]interface{}, 0, len(api.Tags))
+		for _, tag := range api.Tags {
+			tags = append(tags, map[string]interface{}{"name": tag})
+		}
+		spec["tags"] = tags
+	}
+
+	return spec
 }

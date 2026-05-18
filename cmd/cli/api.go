@@ -13,7 +13,7 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
-	"github.com/vedadata/vapim/internal/docs"
+	"github.com/vedadb/vapim/internal/docs"
 )
 
 // APIModel represents an API entity in the platform.

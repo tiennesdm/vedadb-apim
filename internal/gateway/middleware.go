@@ -23,10 +23,10 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"go.uber.org/zap"
 
-	"github.com/tiennesdm/vedadb-apim/pkg/models"
-	"github.com/tiennesdm/vedadb-apim/pkg/store"
-	"github.com/tiennesdm/vedadb-apim/internal/keymanager"
-	"github.com/tiennesdm/vedadb-apim/internal/traffic"
+	"github.com/vedadb/vapim/pkg/models"
+	"github.com/vedadb/vapim/pkg/store"
+	"github.com/vedadb/vapim/internal/keymanager"
+	"github.com/vedadb/vapim/internal/traffic"
 )
 
 // ---------------------------------------------------------------------------

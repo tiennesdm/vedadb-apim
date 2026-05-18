@@ -15,8 +15,8 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"go.uber.org/zap"
 
-	"github.com/tiennesdm/vedadb-apim/pkg/config"
-	"github.com/tiennesdm/vedadb-apim/pkg/store"
+	"github.com/vedadb/vapim/pkg/config"
+	"github.com/vedadb/vapim/pkg/store"
 )
 
 // AdminServer provides the admin API endpoints.

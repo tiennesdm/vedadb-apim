@@ -10,7 +10,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/tiennesdm/vedadb-apim/pkg/models"
+	"github.com/vedadb/vapim/pkg/models"
 )
 
 // PolicyType defines the type of throttle policy.

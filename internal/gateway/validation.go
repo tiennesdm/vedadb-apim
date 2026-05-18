@@ -14,7 +14,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 
-	"github.com/tiennesdm/vedadb-apim/pkg/store"
+	"github.com/vedadb/vapim/pkg/store"
 )
 
 // ---------------------------------------------------------------------------

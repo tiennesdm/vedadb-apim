@@ -44,6 +44,8 @@ CREATE TABLE IF NOT EXISTS apis (
     rating_count INT DEFAULT 0,
     visibility VARCHAR(20) DEFAULT 'public',
     throttle_policy VARCHAR(100),
+    deleted BOOLEAN DEFAULT false,
+    deleted_at TIMESTAMP,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(tenant_id, context, version)
@@ -58,6 +60,8 @@ CREATE TABLE IF NOT EXISTS api_resources (
     description TEXT,
     auth_required BOOLEAN DEFAULT true,
     throttle_policy VARCHAR(100),
+    deleted BOOLEAN DEFAULT false,
+    deleted_at TIMESTAMP,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(api_id, method, path)
 );
@@ -84,6 +88,8 @@ CREATE TABLE IF NOT EXISTS applications (
     tier VARCHAR(50) DEFAULT 'Bronze',
     status VARCHAR(20) DEFAULT 'active',
     callback_url VARCHAR(500),
+    deleted BOOLEAN DEFAULT false,
+    deleted_at TIMESTAMP,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
@@ -107,6 +113,8 @@ CREATE TABLE IF NOT EXISTS subscriptions (
     app_id VARCHAR(36) REFERENCES applications(id),
     tier VARCHAR(50) DEFAULT 'Bronze',
     status VARCHAR(20) DEFAULT 'active',
+    deleted BOOLEAN DEFAULT false,
+    deleted_at TIMESTAMP,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(api_id, app_id)
@@ -162,6 +170,8 @@ CREATE TABLE IF NOT EXISTS throttle_policies (
     burst INT NOT NULL,
     unit VARCHAR(20) NOT NULL,
     conditions TEXT,
+    deleted BOOLEAN DEFAULT false,
+    deleted_at TIMESTAMP,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
@@ -309,3 +319,10 @@ CREATE INDEX IF NOT EXISTS idx_changelog_api ON api_changelog(api_id);
 CREATE INDEX IF NOT EXISTS idx_mocks_api ON api_mocks(api_id);
 CREATE INDEX IF NOT EXISTS idx_schemas_resource ON api_schemas(resource_id);
 CREATE INDEX IF NOT EXISTS idx_throttle_counters_key ON throttle_counters(counter_key);
+
+-- Soft-delete indexes
+CREATE INDEX IF NOT EXISTS idx_apis_deleted ON apis(deleted);
+CREATE INDEX IF NOT EXISTS idx_api_resources_deleted ON api_resources(deleted);
+CREATE INDEX IF NOT EXISTS idx_apps_deleted ON applications(deleted);
+CREATE INDEX IF NOT EXISTS idx_subscriptions_deleted ON subscriptions(deleted);
+CREATE INDEX IF NOT EXISTS idx_throttle_policies_deleted ON throttle_policies(deleted);

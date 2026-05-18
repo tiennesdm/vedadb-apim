@@ -8,7 +8,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/tiennesdm/vedadb-apim/pkg/models"
+	"github.com/vedadb/vapim/pkg/models"
 )
 
 // QuotaManager handles API-level, application-level, and user-level quotas

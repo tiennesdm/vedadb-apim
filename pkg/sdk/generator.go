@@ -10,7 +10,7 @@ import (
 	"text/template"
 	"time"
 
-	"github.com/vedadata/vapim/internal/docs"
+	"github.com/vedadb/vapim/internal/docs"
 )
 
 // Language represents a supported SDK programming language.
@@ -598,7 +598,7 @@ Generated SDK for {{.APIName}} API (v{{.APIVersion}}).
 {{else if eq .Language "python"}}
 ` + "```bash\npip install {{.PackageName}}\n```" + `
 {{else if eq .Language "go"}}
-` + "```bash\ngo get github.com/vedadata/vapim/sdk/{{.PackageName}}\n```" + `
+` + "```bash\ngo get github.com/vedadb/vapim/sdk/{{.PackageName}}\n```" + `
 {{else if eq .Language "java"}}
 Add to your ` + "`pom.xml`" + `:
 ` + "```xml\n<dependency>\n  <groupId>com.vedadata</groupId>\n  <artifactId>{{.PackageName}}</artifactId>\n  <version>{{.APIVersion}}</version>\n</dependency>\n```" + `

@@ -15,8 +15,8 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
-	"github.com/tiennesdm/vedadb-apim/internal/auth"
-	"github.com/tiennesdm/vedadb-apim/pkg/models"
+	"github.com/vedadb/vapim/internal/auth"
+	"github.com/vedadb/vapim/pkg/models"
 )
 
 // OAuth2Store defines the persistence interface needed by the OAuth2 server.

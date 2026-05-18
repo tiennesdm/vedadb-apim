@@ -29,7 +29,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"go.uber.org/zap"
 
-	"github.com/tiennesdm/vedadb-apim/pkg/config"
+	"github.com/vedadb/vapim/pkg/config"
 )
 
 // ---------------------------------------------------------------------------
